@@ -1,0 +1,76 @@
+# modem2sip - one instance per modem.
+#
+# The init script starts one process per /etc/modem2sip/*.toml, so copy this
+# file for a second modem and give each one its own [modem] matcher, sip.bind
+# port, rtp port range, storage.dir and http.bind.
+#
+# `modem2sip --list-modems` prints the values to put in [modem], the ALSA card
+# it matched, and `--list-cards` shows every card on the box.
+
+[general]
+log = "modem2sip=info"
+
+[modem]
+# With nothing set here the first modem ModemManager reports is used, which is
+# what you want on a single-modem router.  Identify the modem explicitly as
+# soon as there is more than one - IMEI is the stable choice.
+# imei = "356938035643809"
+enable = true
+
+[audio]
+# The ALSA card is found by walking sysfs from the modem's device path, so it
+# stays correct across replugs and with several identical modems installed.
+auto      = true
+rate      = 8000
+period_ms = 20
+# Quectel modems keep their USB voice path switched off and every call is
+# silent until AT+QPCMV=1,2; "auto" sends it on those modems only.
+vendor_audio_setup = "auto"
+
+[sip]
+bind       = "0.0.0.0:5060"
+domain     = "modem2sip.lan"
+# Without call_target/sms_target, calls and messages go to whichever client
+# is registered.
+# call_target = "sip:2001@192.168.1.10:5060"
+
+# Require registrations and requests to authenticate.  Leave this section out
+# only on a network you trust completely.
+[sip.auth]
+username = "phone1"
+password = "change-me"
+
+[rtp]
+port_min = 16384
+port_max = 16484
+# On a VoLTE call the network refuses the modem's DTMF request, so "auto"
+# falls back to generating the tones into the uplink audio.
+dtmf_method        = "auto"
+detect_inband_dtmf = true
+
+[storage]
+# Must be persistent, and big enough for MMS attachments - point this at
+# external storage if you receive picture messages, to spare the flash.
+dir = "/srv/modem2sip"
+
+[sms]
+delete_from_modem = true
+notify_sip        = true
+
+[mms]
+# MMSC and (on some carriers) proxy are operator specific.  MMS traffic is
+# bound to the modem's data bearer automatically, and MMSC names are resolved
+# through the carrier's own DNS servers, so bring the data connection up
+# (netifd's modemmanager protocol, or usr/libexec/modem2sip/mms-bearer) and
+# nothing else needs configuring here.
+enabled = false
+# mmsc  = "http://mmsc.ktfwing.com:9082"
+# proxy = "10.0.0.1:8080"
+
+[http]
+# Serves stored messages and MMS attachments, and accepts MMS submissions.
+# It has no TLS: keep it on the LAN and set a token.
+enabled  = true
+bind     = "0.0.0.0:8088"
+# base_url = "http://192.168.1.1:8088"
+token    = "change-me"

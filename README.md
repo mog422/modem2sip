@@ -29,9 +29,16 @@ Reference implementations that informed the design:
   (rusqlite is built bundled).
 
 ```
-sudo apt install build-essential pkg-config libasound2-dev libdbus-1-dev
+sudo apt install build-essential pkg-config libasound2-dev
 cargo build --release
 ```
+
+SQLite is compiled in by default. To link the system library instead — what
+distributions and the OpenWrt package do — build with
+`--no-default-features` and install `libsqlite3-dev`.
+
+For OpenWrt there is a package with a procd service in
+[openwrt/](openwrt/README.md).
 
 ## Quick start
 

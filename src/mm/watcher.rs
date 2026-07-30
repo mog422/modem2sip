@@ -170,12 +170,26 @@ fn path_index(path: &OwnedObjectPath) -> Option<u32> {
 async fn modem_matches(conn: &Connection, path: &OwnedObjectPath, sel: &ModemMatch) -> Result<bool> {
     let modem = ModemProxy::builder(conn).path(path.clone())?.build().await?;
 
+    // An empty string in the config means "not set" - otherwise a stub like
+    // `imei = ""` would silently match nothing at all.
+    let want = |field: &Option<String>| -> Option<String> {
+        field.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    let (sel_device, sel_device_id, sel_imei, sel_primary_port, sel_sim_id, sel_imsi) = (
+        want(&sel.device),
+        want(&sel.device_id),
+        want(&sel.imei),
+        want(&sel.primary_port),
+        want(&sel.sim_id),
+        want(&sel.imsi),
+    );
+
     if let Some(want) = &sel.index {
         if path_index(path) != Some(*want) {
             return Ok(false);
         }
     }
-    if let Some(want) = &sel.device {
+    if let Some(want) = &sel_device {
         let device = modem.device().await.unwrap_or_default();
         // Prefix match so a config can name the USB device while MM reports
         // a deeper path (or vice versa).
@@ -183,12 +197,12 @@ async fn modem_matches(conn: &Connection, path: &OwnedObjectPath, sel: &ModemMat
             return Ok(false);
         }
     }
-    if let Some(want) = &sel.device_id {
+    if let Some(want) = &sel_device_id {
         if !eq_ci(&modem.device_identifier().await.unwrap_or_default(), want) {
             return Ok(false);
         }
     }
-    if let Some(want) = &sel.imei {
+    if let Some(want) = &sel_imei {
         let mut equipment = modem.equipment_identifier().await.unwrap_or_default();
         if equipment.is_empty() {
             if let Ok(p) = Modem3gppProxy::builder(conn).path(path.clone())?.build().await {
@@ -199,23 +213,23 @@ async fn modem_matches(conn: &Connection, path: &OwnedObjectPath, sel: &ModemMat
             return Ok(false);
         }
     }
-    if let Some(want) = &sel.primary_port {
+    if let Some(want) = &sel_primary_port {
         if !eq_ci(&modem.primary_port().await.unwrap_or_default(), want) {
             return Ok(false);
         }
     }
-    if sel.sim_id.is_some() || sel.imsi.is_some() {
+    if sel_sim_id.is_some() || sel_imsi.is_some() {
         let Ok(sim_path) = modem.sim().await else { return Ok(false) };
         if sim_path.as_str() == "/" {
             return Ok(false);
         }
         let sim = SimProxy::builder(conn).path(sim_path)?.build().await?;
-        if let Some(want) = &sel.sim_id {
+        if let Some(want) = &sel_sim_id {
             if !eq_ci(&sim.sim_identifier().await.unwrap_or_default(), want) {
                 return Ok(false);
             }
         }
-        if let Some(want) = &sel.imsi {
+        if let Some(want) = &sel_imsi {
             if !eq_ci(&sim.imsi().await.unwrap_or_default(), want) {
                 return Ok(false);
             }
