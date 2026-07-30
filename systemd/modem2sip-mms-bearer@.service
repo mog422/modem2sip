@@ -1,0 +1,18 @@
+[Unit]
+# Instance name is the APN, e.g. modem2sip-mms-bearer@lte.ktfwing.com.service
+Description=modem2sip MMS data bearer (%i)
+After=ModemManager.service
+Wants=ModemManager.service
+Before=modem2sip@main.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/modem2sip/mms-bearer %i
+# ModemManager may still be probing the modem right after boot.
+ExecStartPre=/bin/sh -c 'for i in $(seq 30); do mmcli -L | grep -q Modem && exit 0; sleep 2; done; exit 1'
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,74 @@
+#!/bin/sh
+# Bring up the modem's data bearer for MMS and route it without disturbing
+# the host's default route.
+#
+# MMS traffic has to leave through the mobile data connection, but the box
+# usually reaches the internet over its own uplink and must keep doing so
+# (that is where the SSH session lives).  So instead of adding a default
+# route, this script puts one in a private routing table and adds rules that
+# only match traffic sourced from the modem - which is exactly what modem2sip
+# does when it binds MMS sockets to the bearer's address.
+#
+#   usage: mms-bearer <apn> [modem-index]
+#   e.g.:  mms-bearer lte.ktfwing.com
+#
+# Re-running it is safe: everything is applied idempotently.
+
+set -eu
+
+APN="${1:?usage: mms-bearer <apn> [modem-index]}"
+MODEM="${2:-}"
+TABLE="${MMS_ROUTE_TABLE:-100}"
+
+if [ -z "$MODEM" ]; then
+    MODEM=$(mmcli -L | sed -n 's|.*/Modem/\([0-9]\+\).*|\1|p' | head -1)
+fi
+[ -n "$MODEM" ] || { echo "no modem found" >&2; exit 1; }
+
+# Connect only when there is no connected bearer with an interface yet.
+# (`mmcli --list-bearers` does not exist in every ModemManager release, so the
+# bearer paths are taken from the modem's own output.)
+bearer_with_iface() {
+    for b in $(mmcli -m "$MODEM" | sed -n 's|.*/Bearer/\([0-9]\+\).*|\1|gp' | sort -u); do
+        out=$(mmcli -b "$b" 2>/dev/null) || continue
+        printf '%s\n' "$out" | grep -q "interface:" || continue
+        printf '%s\n' "$out" | grep -q "connected: yes" || continue
+        echo "$b"
+        return 0
+    done
+    return 1
+}
+
+if ! BEARER=$(bearer_with_iface); then
+    echo "connecting APN $APN on modem $MODEM"
+    mmcli -m "$MODEM" --simple-connect="apn=$APN,ip-type=ipv4v6" >/dev/null
+    sleep 3
+    BEARER=$(bearer_with_iface) || { echo "bearer did not come up" >&2; exit 1; }
+fi
+
+info=$(mmcli -b "$BEARER")
+field() { printf '%s\n' "$info" | sed -n "s/.*$1: *\([^ ]*\).*/\1/p" | head -1; }
+
+IFACE=$(field interface)
+ADDR=$(field address)
+PREFIX=$(field prefix)
+GW=$(field gateway)
+
+[ -n "$IFACE" ] && [ -n "$ADDR" ] || { echo "bearer $BEARER has no IPv4 config" >&2; exit 1; }
+echo "bearer $BEARER: $IFACE $ADDR/$PREFIX via $GW"
+
+ip link set "$IFACE" up
+ip addr replace "$ADDR/$PREFIX" dev "$IFACE"
+
+# A default route for the modem, but only in its own table.  The on-link
+# route for the bearer subnet is created by the kernel in the main table when
+# the address is added, and the standard "from all lookup main" rule still
+# applies after this table, so the gateway stays resolvable.
+ip route replace default via "$GW" dev "$IFACE" table "$TABLE"
+
+# Match both ways modem2sip can pin the traffic: bound source address
+# (mms.local_ip) and SO_BINDTODEVICE (mms.interface).
+ip rule list | grep -q "from $ADDR lookup $TABLE" || ip rule add from "$ADDR" table "$TABLE"
+ip rule list | grep -q "oif $IFACE lookup $TABLE"  || ip rule add oif "$IFACE" table "$TABLE"
+
+echo "ready: MMS traffic from $ADDR / $IFACE uses table $TABLE"

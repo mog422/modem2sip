@@ -1,0 +1,150 @@
+# modem2sip configuration.
+# One process drives exactly one modem: copy this file per modem and give
+# each instance its own [modem] matcher, SIP port, RTP range and database.
+
+[general]
+log  = "info"          # e.g. "modem2sip=debug,zbus=warn"
+name = "modem-1"
+
+# --------------------------------------------------------------------------
+# Which modem this process owns.  Every field that is set must match.
+# Run `modem2sip --list-modems` to see the values of your modems.
+# --------------------------------------------------------------------------
+[modem]
+imei = "356938035643809"
+# device       = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-3"
+# device_id    = "d1a1b2..."
+# primary_port = "cdc-wdm0"
+# sim_id       = "8982061..."
+# imsi         = "450051234567890"
+# index        = 0                  # unstable across replugs, prefer imei
+enable = true                       # enable the modem if MM reports it disabled
+# own_number = "+821012345678"      # used when the SIM does not report one
+# Optional: any other vendor setup ModemManager cannot do.  Runs on every
+# modem-ready event with M2S_AT_PORT, M2S_ALSA_DEVICE, M2S_DEVICE, ... set.
+# ready_command = "/usr/local/libexec/modem2sip/my-modem-setup"
+
+# --------------------------------------------------------------------------
+# Voice path.  The ALSA card is auto-detected by walking sysfs from the
+# modem's device path, so the right card is picked even with several
+# identical modems installed.  `modem2sip --list-cards` shows what exists.
+# --------------------------------------------------------------------------
+[audio]
+auto      = true
+# device          = "plughw:1,0"    # overrides auto-detection (both directions)
+# capture_device  = "plughw:1,0"
+# playback_device = "plughw:1,0"
+# card_hint       = "Quectel"       # only used to disambiguate
+rate      = 8000                    # native rate of the modem card (8000/16000)
+period_ms = 20                      # also the RTP packetisation time
+periods   = 4
+tx_gain   = 1.0                     # modem -> SIP
+rx_gain   = 1.0                     # SIP -> modem
+use_mm_audio_port = true            # honour Call.AudioPort when the driver sets it
+
+# Quectel modems keep their USB voice path off (AT+QPCMV=0) even with
+# AT+QDAI=5, which makes every call connect but stay silent.  ModemManager has
+# no API for it, so modem2sip sends that one command itself - on start-up, on
+# every replug, and before a call if the path went away.
+#   "auto"   apply on Quectel modems (default)
+#   "always" apply on any modem that exposes an AT port
+#   "never"  never touch an AT port
+vendor_audio_setup = "auto"
+
+# --------------------------------------------------------------------------
+# SIP
+# --------------------------------------------------------------------------
+[sip]
+bind       = "0.0.0.0:5060"
+# public_ip = "192.0.2.10"          # advertised in Via/Contact/SDP behind NAT
+domain     = "modem2sip.local"
+user_agent = "modem2sip/0.1"
+ring_timeout_secs = 60
+options_reflect_modem = true        # OPTIONS answers 503 while the modem is down
+retry_after_secs = 30
+# allow = ["192.168.1.0/24"]        # source ACL, empty = anyone
+# call_target = "sip:2001@192.168.1.10:5060"   # where inbound calls are sent
+# sms_target  = "sip:2001@192.168.1.10:5060"   # defaults to call_target
+# from_user   = "modem1"
+
+# Require inbound requests to authenticate (digest).
+# [sip.auth]
+# username = "gateway"
+# password = "s3cret"
+
+# Optionally also register to an upstream PBX.  The built-in server keeps
+# listening either way.
+# [sip.register]
+# registrar    = "sip:pbx.example.net"
+# username     = "modem1"
+# password     = "s3cret"
+# expires      = 300
+# contact_user = "modem1"
+
+[rtp]
+# bind    = "0.0.0.0"               # defaults to the SIP bind address
+port_min  = 16384
+port_max  = 16584
+jitter_ms = 60
+dtmf_payload_type = 101
+symmetric = true                    # latch onto the source of the first packet
+
+# DTMF.  On a VoLTE call there is no CS domain, and modems commonly reject
+# both Call.SendDtmf and AT+VTS ("network rejected request"), so the tones are
+# generated into the uplink audio instead.
+#   "auto"   ModemManager first, in-band tones when it refuses (default)
+#   "modem"  Call.SendDtmf only
+#   "inband" tones only
+#   "none"   drop digits
+dtmf_method  = "auto"
+dtmf_tone_ms = 180
+dtmf_gap_ms  = 80
+# Watch the audio from the network for DTMF and relay it to SIP as INFO.
+detect_inband_dtmf = true
+
+# --------------------------------------------------------------------------
+# Storage
+# --------------------------------------------------------------------------
+[storage]
+dir = "/var/lib/modem2sip/modem-1"
+db  = "modem2sip.db"                # relative to dir unless absolute
+
+[sms]
+delete_from_modem = true            # only after the message is safely in SQLite
+notify_sip        = true
+delivery_report   = false
+
+# --------------------------------------------------------------------------
+# MMS.  ModemManager has no MMS API: MMS arrives as a WAP-push SMS and the
+# body is fetched from the carrier's MMSC over the data bearer.  The values
+# below are carrier specific (SKT/KT/LGU+ each use their own MMSC/proxy).
+# --------------------------------------------------------------------------
+[mms]
+enabled       = false
+# mmsc        = "http://mmsc.ktfwing.com:9082"        # KT (tested)
+# mmsc        = "http://omms.nate.com:9082/oma_uni"   # SKT
+# proxy       = "smart.nate.com:9093"                 # WAP gateway, host:port
+# MMS traffic is bound to the modem's data bearer automatically (interface,
+# source address and DNS servers come from ModemManager, so they follow
+# re-attaches).  MMSC names are resolved by the carrier's resolvers over the
+# modem, because they often do not exist in public DNS - or resolve to
+# addresses only the operator can route.  Set these only to override it.
+# interface   = "wwan0"
+# local_ip    = "10.64.0.2"
+# dns         = ["211.219.86.1"]
+auto_retrieve = true
+max_size      = 2097152
+user_agent    = "modem2sip/0.1"
+# ua_profile  = "http://example.com/uaprof.xml"
+# setup_command = "/usr/local/sbin/mms-route-up.sh"   # run before MMS traffic
+timeout_secs  = 60
+
+# --------------------------------------------------------------------------
+# Local control API: MMS submission with attachments, message browsing, and
+# the download links referenced by the MMS notifications sent over SIP.
+# --------------------------------------------------------------------------
+[http]
+enabled  = true
+bind     = "127.0.0.1:8088"
+# base_url = "http://192.168.1.5:8088"   # used when building attachment links
+# token    = "change-me"                 # required as: Authorization: Bearer ...

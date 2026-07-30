@@ -1,0 +1,26 @@
+[Unit]
+Description=modem2sip gateway (%i)
+Documentation=file:/usr/local/share/doc/modem2sip/README.md
+After=ModemManager.service network-online.target sound.target
+Wants=ModemManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/modem2sip --config /etc/modem2sip/%i.toml
+Restart=always
+RestartSec=5
+
+# The gateway needs the sound card of its modem and the system bus.
+SupplementaryGroups=audio
+# Only needed when mms.interface is set (SO_BINDTODEVICE).
+AmbientCapabilities=CAP_NET_RAW
+
+StateDirectory=modem2sip
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/modem2sip
+
+[Install]
+WantedBy=multi-user.target
