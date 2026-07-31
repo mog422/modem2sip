@@ -6,7 +6,7 @@
 //! behaviour a jitter buffer needs.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,24 +43,29 @@ struct Signalled {
 /// Milliseconds since the session started, for the inactivity check.  An
 /// `Instant` cannot live in an atomic, and the receiver has to be able to
 /// stamp this without taking a lock on every packet.
+///
+/// The counter is 32 bits because the 32-bit OpenWrt targets have no 64-bit
+/// atomics.  It saturates after 49 days, which is far past any call.
 struct Clock {
     started: std::time::Instant,
-    last_rtp_ms: AtomicU64,
+    last_rtp_ms: AtomicU32,
 }
 
 impl Clock {
     fn new() -> Self {
-        Self { started: std::time::Instant::now(), last_rtp_ms: AtomicU64::new(0) }
+        Self { started: std::time::Instant::now(), last_rtp_ms: AtomicU32::new(0) }
+    }
+    fn elapsed_ms(&self) -> u32 {
+        self.started.elapsed().as_millis().min(u32::MAX as u128) as u32
     }
     fn stamp(&self) {
-        self.last_rtp_ms
-            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.last_rtp_ms.store(self.elapsed_ms(), Ordering::Relaxed);
     }
     /// How long since the last RTP packet, counting from the session start
     /// while none has arrived at all.
     fn since_last_rtp(&self) -> Duration {
-        let now = self.started.elapsed().as_millis() as u64;
-        Duration::from_millis(now.saturating_sub(self.last_rtp_ms.load(Ordering::Relaxed)))
+        let idle = self.elapsed_ms().saturating_sub(self.last_rtp_ms.load(Ordering::Relaxed));
+        Duration::from_millis(idle as u64)
     }
 }
 

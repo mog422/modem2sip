@@ -461,9 +461,20 @@ impl Config {
             "rtp.dtmf_payload_type must be a dynamic type (96..127)"
         );
         anyhow::ensure!(self.sip.ring_timeout_secs > 0, "sip.ring_timeout_secs must be > 0");
-        anyhow::ensure!(self.audio.period_ms > 0, "audio.period_ms must be > 0");
-        anyhow::ensure!(self.audio.rate >= 8000, "audio.rate must be >= 8000");
-        anyhow::ensure!(self.audio.periods >= 2, "audio.periods must be >= 2");
+        // The upper bounds are what keeps the ALSA period and buffer sizes
+        // inside a C long, which is 32 bits wide on the OpenWrt targets.
+        anyhow::ensure!(
+            (1..=200).contains(&self.audio.period_ms),
+            "audio.period_ms must be between 1 and 200"
+        );
+        anyhow::ensure!(
+            (8000..=192_000).contains(&self.audio.rate),
+            "audio.rate must be between 8000 and 192000"
+        );
+        anyhow::ensure!(
+            (2..=32).contains(&self.audio.periods),
+            "audio.periods must be between 2 and 32"
+        );
         for (what, gain) in [("tx_gain", self.audio.tx_gain), ("rx_gain", self.audio.rx_gain)] {
             anyhow::ensure!(
                 gain.is_finite() && (0.0..=16.0).contains(&gain),

@@ -9,12 +9,14 @@
 //! or missing card fail the call instead of the process.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+// AtomicU32 rather than AtomicU64: the 32-bit OpenWrt targets have no 64-bit
+// atomics, and these are event counters that will never come close to 2^32.
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use alsa::pcm::{Access, Format, HwParams, PCM};
+use alsa::pcm::{Access, Format, Frames, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 use anyhow::{anyhow, Result};
 use tracing::{debug, info, warn};
@@ -55,8 +57,8 @@ pub struct AudioRings {
     target: usize,
     /// Backlog that triggers a trim.
     high_water: usize,
-    pub underruns: AtomicU64,
-    pub overruns: AtomicU64,
+    pub underruns: AtomicU32,
+    pub overruns: AtomicU32,
 }
 
 /// Hard ceiling on queued DTMF, in samples (~8 s at 8 kHz).
@@ -254,6 +256,15 @@ impl Drop for AudioStream {
 
 type Ready = mpsc::Sender<Result<(&'static str, u32), String>>;
 
+/// Frames in `ms` milliseconds at `rate`.
+///
+/// alsa-lib counts frames in a C long, so this is 32 bits wide on the 32-bit
+/// OpenWrt targets.  `Config::validate` bounds the rate, the period and the
+/// period count precisely so the products below stay well inside that.
+fn period_frames(rate: u32, ms: u32) -> Frames {
+    (rate as u64 * ms as u64 / 1000) as Frames
+}
+
 /// Returns the PCM plus the rate the card actually accepted.
 fn open_pcm(device: &str, dir: Direction, params: &AudioParams) -> Result<(PCM, u32), alsa::Error> {
     let pcm = PCM::new(device, dir, false)?;
@@ -263,14 +274,14 @@ fn open_pcm(device: &str, dir: Direction, params: &AudioParams) -> Result<(PCM, 
         hwp.set_format(Format::s16())?;
         hwp.set_channels(1)?;
         hwp.set_rate(params.card_rate, ValueOr::Nearest)?;
-        let period = (params.card_rate as u64 * params.period_ms as u64 / 1000) as i64;
+        let period = period_frames(params.card_rate, params.period_ms);
         hwp.set_period_size_near(period, ValueOr::Nearest)?;
-        hwp.set_buffer_size_near(period * params.periods.max(2) as i64)?;
+        hwp.set_buffer_size_near(period * params.periods.max(2) as Frames)?;
         pcm.hw_params(&hwp)?;
         hwp.get_rate()?
     };
     {
-        let period = (rate as u64 * params.period_ms as u64 / 1000) as i64;
+        let period = period_frames(rate, params.period_ms);
         let swp = pcm.sw_params_current()?;
         swp.set_start_threshold(if matches!(dir, Direction::Playback) { period } else { 1 })?;
         swp.set_avail_min(period)?;
