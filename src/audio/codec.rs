@@ -217,10 +217,6 @@ pub struct DtmfHit {
     pub twist: f32,
 }
 
-pub fn detect_dtmf(samples: &[i16], rate: u32) -> Option<char> {
-    detect_dtmf_detailed(samples, rate).map(|h| h.digit)
-}
-
 /// Detect a DTMF digit in one analysis window.
 ///
 /// Requires a clear winner in each group (4x the runner-up) so speech does
@@ -338,7 +334,7 @@ mod tests {
         let mut last: Option<char> = None;
         let mut miss = 0;
         for chunk in samples.chunks(window) {
-            match detect_dtmf(chunk, rate) {
+            match detect_dtmf_detailed(chunk, rate).map(|h| h.digit) {
                 Some(d) => {
                     if last != Some(d) {
                         out.push(d);
