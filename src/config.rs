@@ -276,6 +276,12 @@ pub struct Rtp {
     /// relay them to SIP as INFO.  `Call.DtmfReceived` is unreliable on the
     /// modems that need in-band DTMF in the first place.
     pub detect_inband_dtmf: bool,
+    /// End a call whose SIP peer has sent no RTP for this many seconds.
+    ///
+    /// A peer that dies without a BYE - a PBX restarted, a network that went
+    /// away - leaves the mobile leg connected and billed with nothing on
+    /// either side to notice.  0 disables the check.
+    pub timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -301,6 +307,7 @@ impl Default for Rtp {
             dtmf_tone_ms: 180,
             dtmf_gap_ms: 80,
             detect_inband_dtmf: true,
+            timeout_secs: 60,
         }
     }
 }
@@ -450,7 +457,7 @@ impl Config {
         anyhow::ensure!(self.rtp.port_min < self.rtp.port_max, "rtp.port_min must be < rtp.port_max");
         anyhow::ensure!(self.rtp.port_min >= 1024, "rtp.port_min must be >= 1024");
         anyhow::ensure!(
-            self.rtp.dtmf_payload_type >= 96,
+            (96..=127).contains(&self.rtp.dtmf_payload_type),
             "rtp.dtmf_payload_type must be a dynamic type (96..127)"
         );
         anyhow::ensure!(self.sip.ring_timeout_secs > 0, "sip.ring_timeout_secs must be > 0");

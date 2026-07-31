@@ -138,6 +138,7 @@ impl MmsManager {
             .or_else(|| Some(sms.number.clone()))
             .unwrap_or_default();
         let tid = notification.transaction_id.clone();
+        let external_id = tid.clone().or_else(|| notification.message_id.clone());
 
         let id = self
             .db
@@ -150,14 +151,35 @@ impl MmsManager {
                 text: None,
                 timestamp: notification.date.map(unix_to_iso),
                 status: "notified".into(),
-                external_id: tid.clone().or_else(|| notification.message_id.clone()),
+                external_id: external_id.clone(),
                 raw: Some(push.body.clone()),
             })
             .await?;
 
-        let Some(id) = id else {
-            debug!("duplicate MMS notification ignored");
-            return Ok(None);
+        let id = match id {
+            Some(id) => id,
+            // The carrier re-notifies with the same transaction id when a
+            // message has not been fetched, which is exactly what the failure
+            // path below relies on to get another chance.  Treating that as a
+            // plain duplicate meant the retry it was waiting for could never
+            // arrive, so a message whose first download failed - the bearer
+            // being down is routine - was lost when the MMSC expired it.
+            None => match self.retriable_duplicate(external_id.as_deref()).await {
+                Some(existing) => {
+                    info!(id = existing, "the carrier re-notified a message we still owe; retrying");
+                    if let Err(e) = self.retrieve(&notification, existing).await {
+                        warn!(id = existing, error = %format!("{e:#}"), "MMS retry failed");
+                        self.db.set_status(existing, "retrieve_failed", Some(&e.to_string())).await?;
+                        return Ok(None);
+                    }
+                    // Retrieved at last: the caller may now notify SIP.
+                    return Ok(Some(existing));
+                }
+                None => {
+                    debug!("duplicate MMS notification ignored");
+                    return Ok(None);
+                }
+            },
         };
 
         info!(
@@ -190,6 +212,24 @@ impl MmsManager {
             self.db.set_status(id, "retrieve_failed", Some(&e.to_string())).await?;
         }
         Ok(Some(id))
+    }
+
+    /// The id of an already-stored notification whose body is still missing.
+    ///
+    /// `None` when there is nothing to retry: the message was fetched, MMS is
+    /// switched off, or retrieval is left to the HTTP API.
+    async fn retriable_duplicate(&self, external_id: Option<&str>) -> Option<i64> {
+        if !self.cfg.mms.enabled || !self.cfg.mms.auto_retrieve {
+            return None;
+        }
+        let existing = self
+            .db
+            .find_by_external_id("mms", Direction::Incoming, external_id?)
+            .await
+            .ok()
+            .flatten()?;
+        let (id, status) = existing;
+        matches!(status.as_str(), "notified" | "retrieve_failed").then_some(id)
     }
 
     /// Retry a stored notification: used for messages that arrived while MMS

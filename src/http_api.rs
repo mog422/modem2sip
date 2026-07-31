@@ -256,7 +256,14 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                             text: Some(body.text.clone()),
                             timestamp: None,
                             status: "sent".into(),
-                            external_id: Some(path.to_string()),
+                            // ModemManager restarts its object numbering, so
+                            // the bare path collides with an earlier run's and
+                            // the message would be dropped as a duplicate.
+                            external_id: Some(format!(
+                                "{}|{}",
+                                path.as_str(),
+                                crate::db::now_iso()
+                            )),
                             raw: None,
                         })
                         .await

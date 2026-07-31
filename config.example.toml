@@ -94,6 +94,10 @@ port_max  = 16584
 jitter_ms = 60
 dtmf_payload_type = 101
 symmetric = true                    # latch onto the source of the first packet
+# End a call whose SIP peer has sent no RTP for this long.  A peer that dies
+# without a BYE (a PBX restarted, a network that went away) otherwise leaves
+# the mobile leg connected and billed.  0 disables the check.
+timeout_secs = 60
 
 # DTMF.  On a VoLTE call there is no CS domain, and modems commonly reject
 # both Call.SendDtmf and AT+VTS ("network rejected request"), so the tones are

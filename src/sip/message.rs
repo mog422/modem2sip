@@ -356,16 +356,30 @@ fn unfold(head: &str) -> String {
     out
 }
 
+/// Strip anything that would end a header line early.
+///
+/// Header values are assembled from numbers, subjects and addresses the
+/// network supplied; a CR or LF in one of them would close the header and let
+/// whoever sent it write the rest of the message.  Nothing legitimate needs a
+/// control character here, so they are dropped rather than escaped.
+fn header_safe(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        std::borrow::Cow::Owned(value.chars().filter(|c| !c.is_control()).collect())
+    } else {
+        std::borrow::Cow::Borrowed(value)
+    }
+}
+
 fn serialize(start_line: &str, headers: &Headers, body: &[u8]) -> Vec<u8> {
     let mut head = String::with_capacity(512);
-    let _ = writeln!(head, "{start_line}\r");
+    let _ = writeln!(head, "{}\r", header_safe(start_line));
     let mut wrote_len = false;
     for (k, v) in &headers.0 {
         if k == "content-length" {
             wrote_len = true;
             let _ = writeln!(head, "Content-Length: {}\r", body.len());
         } else {
-            let _ = writeln!(head, "{}: {}\r", pretty(k), v);
+            let _ = writeln!(head, "{}: {}\r", pretty(k), header_safe(v));
         }
     }
     if !wrote_len {
@@ -496,5 +510,24 @@ mod tests {
         assert_eq!(req.headers.call_id(), Some("xyz"));
         assert_eq!(req.headers.get("subject"), Some("hello world"));
         assert_eq!(req.body, b"hi");
+    }
+
+    /// Header values are built from numbers and subjects the mobile network
+    /// supplied; a CRLF in one of them must not be able to close the header
+    /// and write the rest of the message.
+    #[test]
+    fn a_header_value_cannot_end_its_own_line() {
+        let mut req = Request::new(Method::Message, Uri::parse("sip:gw").unwrap());
+        req.headers.set("from", "<sip:a@h>\r\nContact: <sip:evil@h>");
+        req.headers.set("subject", "hi\nthere");
+        let text = String::from_utf8(req.encode()).unwrap();
+        // The injected text survives as part of the value, which is harmless;
+        // what must not survive is it starting a line of its own.
+        assert!(
+            !text.lines().any(|l| l.starts_with("Contact:")),
+            "injected header survived: {text}"
+        );
+        assert!(text.contains("From: <sip:a@h>Contact: <sip:evil@h>\r\n"));
+        assert!(text.contains("Subject: hithere\r\n"));
     }
 }

@@ -45,7 +45,19 @@ enum Internal {
     Dtmf { call_id: String, digit: char },
     /// A DTMF tone was heard in the audio from the mobile side (modem -> SIP).
     DtmfFromModem { call_id: String, digit: char },
+    /// Look at an incoming SMS again: it was still being assembled last time.
+    SmsRetry { path: OwnedObjectPath, attempt: u32 },
 }
+
+/// How often, and how far apart, an SMS that is still arriving is re-read.
+///
+/// ModemManager announces a concatenated message when its *first* part lands,
+/// with `State = RECEIVING`, and never signals again once the rest arrives -
+/// so a message that is not complete on arrival has to be looked at again or
+/// it is lost.  Ten seconds covers the segments of a long message; a message
+/// still incomplete after that has lost parts on the air and never completes.
+const SMS_ASSEMBLY_ATTEMPTS: u32 = 10;
+const SMS_ASSEMBLY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -83,6 +95,9 @@ struct ActiveCall {
     media_dtmf_pt: Option<u8>,
 
     answered: bool,
+    /// A digest challenge on our own INVITE has already been answered once,
+    /// so a second one is a refusal rather than an invitation to try again.
+    auth_retried: bool,
     ringing_sent: bool,
     /// A 183 with SDP has been sent and the audio path is already up.
     early_media: bool,
@@ -206,7 +221,7 @@ impl Gateway {
                 }
             }
             ModemEvent::SmsAdded { path, received } => {
-                self.on_sms_added(path, received).await?;
+                self.on_sms_added(path, received, 0).await?;
             }
         }
         Ok(())
@@ -323,6 +338,7 @@ impl Gateway {
             remote_sdp: None,
             media_dtmf_pt: None,
             answered: false,
+            auth_retried: false,
             ringing_sent: false,
             early_media: false,
             cdr_id,
@@ -626,6 +642,7 @@ impl Gateway {
             remote_sdp: Some(remote_sdp),
             media_dtmf_pt: None,
             answered: false,
+            auth_retried: false,
             ringing_sent: false,
             early_media: false,
             cdr_id,
@@ -732,11 +749,21 @@ impl Gateway {
 
         // A CANCEL has no To tag - it matches the INVITE *transaction*, so
         // the Call-ID and the INVITE's sequence number are what identify it.
+        //
+        // RFC 3261 §9.2: it only has an effect while that transaction is
+        // still pending.  Acting on a late one (UDP reordering, or anyone who
+        // saw the Call-ID on the wire - a CANCEL is never challenged) used to
+        // hang up a connected call and drop it without a BYE, leaving the
+        // peer on a dialog nothing would ever end.  Nor can it touch a call
+        // we placed: that INVITE is ours, and its transaction is not the
+        // peer's to cancel.
         let matches = self
             .call
             .as_ref()
             .map(|c| {
-                Some(c.call_id.as_str()) == req.headers.call_id()
+                c.role == Role::FromSip
+                    && !c.answered
+                    && Some(c.call_id.as_str()) == req.headers.call_id()
                     && req.headers.cseq().map(|(n, _)| n)
                         == c.invite.headers.cseq().map(|(n, _)| n)
             })
@@ -870,7 +897,7 @@ impl Gateway {
             let code = match modem.send_sms(&number, &text, delivery_report).await {
                 Ok(path) => {
                     info!(to = %number, "SMS submitted to the modem");
-                    let _ = shared
+                    let stored = shared
                         .db
                         .insert_message(NewMessage {
                             kind: "sms",
@@ -881,10 +908,13 @@ impl Gateway {
                             text: Some(text.clone()),
                             timestamp: None,
                             status: "sent".into(),
-                            external_id: Some(path.to_string()),
+                            external_id: Some(outgoing_sms_id(&path)),
                             raw: None,
                         })
                         .await;
+                    if let Err(e) = stored {
+                        warn!(error = %format!("{e:#}"), "the SMS went out but could not be recorded");
+                    }
                     202
                 }
                 Err(e) => {
@@ -918,8 +948,24 @@ impl Gateway {
                 if !self.call_id_matches(&call_id) {
                     return Ok(());
                 }
+                // A challenge is not a rejection: a PBX that authenticates its
+                // endpoints - Asterisk does by default, registration or no
+                // registration - answers the first INVITE with a 401, and
+                // giving up on it meant no call from the mobile network could
+                // ever be delivered in that deployment.
+                if matches!(resp.code, 401 | 407) {
+                    self.ack_failure(&resp).await;
+                    match self.retry_invite_with_auth(&resp).await {
+                        Ok(true) => return Ok(()),
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(error = %format!("{e:#}"), "could not answer the INVITE challenge")
+                        }
+                    }
+                } else {
+                    self.ack_failure(&resp).await;
+                }
                 warn!(code = resp.code, "the SIP side rejected the call");
-                self.ack_failure(&resp).await;
                 if let (Some(modem), Some(path)) =
                     (self.modem.clone(), self.call.as_ref().and_then(|c| c.mm_path.clone()))
                 {
@@ -934,6 +980,7 @@ impl Gateway {
                 }
                 Ok(())
             }
+            Internal::SmsRetry { path, attempt } => self.on_sms_added(path, true, attempt).await,
             Internal::DtmfFromModem { call_id, digit } => {
                 if self.call_id_matches(&call_id) {
                     info!(%digit, "DTMF heard from the mobile side, relaying as INFO");
@@ -1051,6 +1098,68 @@ impl Gateway {
         let _ = self.core.send_raw(&ack, call.remote_addr).await;
     }
 
+    /// Answer a digest challenge on the INVITE we sent and send it again.
+    ///
+    /// Returns false when there is nothing to retry - no credentials, no
+    /// parsable challenge, or the challenge has already been answered once -
+    /// in which case the caller treats the response as the rejection it is.
+    async fn retry_invite_with_auth(&mut self, resp: &Response) -> Result<bool> {
+        let Some(call) = self.call.as_ref() else { return Ok(false) };
+        if call.role != Role::ToSip || call.answered || call.auth_retried {
+            return Ok(false);
+        }
+        let Some(up) = self.shared.cfg.sip.register.as_ref() else {
+            debug!("challenged on an INVITE but no credentials are configured");
+            return Ok(false);
+        };
+
+        let (hdr, out_hdr) = if resp.code == 401 {
+            ("www-authenticate", "authorization")
+        } else {
+            ("proxy-authenticate", "proxy-authorization")
+        };
+        let Some(challenge) =
+            resp.headers.get(hdr).and_then(crate::sip::auth::Challenge::parse)
+        else {
+            warn!(code = resp.code, "challenge without a parsable {hdr} header");
+            return Ok(false);
+        };
+
+        // A fresh branch and sequence number: this is a new transaction, not a
+        // retransmission of the one that was just refused.
+        let cseq = self.core.next_cseq();
+        let mut invite = call.invite.clone();
+        let uri = invite.uri.to_string();
+        let creds = crate::sip::auth::answer(
+            &challenge,
+            &up.username,
+            &up.password,
+            Method::Invite.as_str(),
+            &uri,
+            &invite.body,
+            1,
+        );
+        invite.headers.set("cseq", format!("{cseq} INVITE"));
+        invite.headers.set(out_hdr, creds.to_header());
+        crate::sip::core::refresh_via_branch(&mut invite.headers);
+
+        let dest = call.remote_addr;
+        let txn = self.core.send_request(invite.clone(), dest).await?;
+
+        let (tx, call_id, ring_timeout) = (
+            self.internal_tx.clone(),
+            call.call_id.clone(),
+            Duration::from_secs(self.shared.cfg.sip.ring_timeout_secs),
+        );
+        let call = self.call.as_mut().expect("checked above");
+        call.auth_retried = true;
+        call.local_cseq = cseq;
+        call.invite = invite;
+        call.tasks.push(tokio::spawn(invite_response_task(txn, call_id, tx, ring_timeout)));
+        info!(code = resp.code, "answering the INVITE challenge and dialling again");
+        Ok(true)
+    }
+
     /// Our INVITE (modem -> SIP) was answered with a 2xx.
     async fn on_sip_answered(&mut self, resp: Response) -> Result<()> {
         if self.call.is_none() {
@@ -1148,16 +1257,24 @@ impl Gateway {
 
     /// The ALSA threads give up on a card that keeps failing (a modem that is
     /// being unplugged, for instance).  A call with no audio is worse than no
-    /// call, so end it.
+    /// call, so end it.  The same tick notices a SIP peer that stopped
+    /// sending, which is the only sign we get that it is gone.
     async fn check_media(&mut self) {
-        let dead = self
-            .call
-            .as_ref()
-            .and_then(|c| c.media.as_ref())
-            .map(|m| m.audio_failed())
-            .unwrap_or(false);
-        if dead {
+        let Some(media) = self.call.as_ref().and_then(|c| c.media.as_ref()) else { return };
+        if media.audio_failed() {
             self.teardown_call("the modem audio stream died", 200).await;
+            return;
+        }
+        let timeout = Duration::from_secs(self.shared.cfg.rtp.timeout_secs);
+        if !timeout.is_zero() && media.silence() > timeout {
+            // Nothing else would ever end this call: a peer that vanished
+            // without a BYE cannot be asked, and the mobile leg stays up -
+            // and billed - until the process is restarted.
+            warn!(
+                seconds = timeout.as_secs(),
+                "no RTP from the SIP peer; assuming it is gone and ending the call"
+            );
+            self.teardown_call("the SIP peer stopped sending RTP", 200).await;
         }
     }
 
@@ -1373,7 +1490,12 @@ impl Gateway {
 
     // --------------------------------------------------------------- messaging
 
-    async fn on_sms_added(&mut self, path: OwnedObjectPath, received: bool) -> Result<()> {
+    async fn on_sms_added(
+        &mut self,
+        path: OwnedObjectPath,
+        received: bool,
+        attempt: u32,
+    ) -> Result<()> {
         let Some(modem) = self.modem.clone() else { return Ok(()) };
         let info = match modem.sms_info(&path).await {
             Ok(i) => i,
@@ -1386,6 +1508,27 @@ impl Gateway {
         let is_incoming = info.pdu_type == sms_state::PDU_DELIVER
             || (received && info.pdu_type != sms_state::PDU_SUBMIT);
         let is_ready = matches!(info.state, sms_state::STATE_RECEIVED | sms_state::STATE_STORED);
+        if is_incoming && info.state == sms_state::STATE_RECEIVING {
+            // A message that arrives in more than one part is announced when
+            // the first part lands and is never announced again, so this is
+            // the only chance to notice the rest.  Anything longer than 160
+            // GSM-7 or 70 UCS-2 characters comes this way - most Korean text
+            // messages - and used to be dropped here and never stored.
+            if attempt >= SMS_ASSEMBLY_ATTEMPTS {
+                warn!(
+                    path = path.as_str(),
+                    "an incoming SMS never finished arriving; parts must have been lost"
+                );
+                return Ok(());
+            }
+            let tx = self.internal_tx.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(SMS_ASSEMBLY_INTERVAL).await;
+                let _ = tx.send(Internal::SmsRetry { path, attempt: attempt + 1 }).await;
+            });
+            return Ok(());
+        }
         if !is_incoming || !is_ready {
             debug!(
                 path = path.as_str(),
@@ -1520,6 +1663,11 @@ pub async fn notify_sip_message(
     };
 
     let domain = core.domain();
+    // The peer is a number the network reported - for MMS it is a free-form
+    // address decoded from a PDU an SMS sender wrote, so it can hold anything
+    // at all, CRLF included.  It goes into a header, so it is reduced to the
+    // dialling characters here rather than being trusted to be a number.
+    let peer = sanitize_number(peer);
     let from_user = if peer.is_empty() { "unknown".to_string() } else { peer.to_string() };
     let from = NameAddr {
         display: Some(from_user.clone()),
@@ -1767,6 +1915,17 @@ fn normalise_alsa(port: &str) -> String {
     port.to_string()
 }
 
+/// Identity for a message we sent ourselves.
+///
+/// ModemManager numbers its SMS objects from zero on every start, so the bare
+/// object path collides with one from a previous run - and the database, which
+/// outlives it, threw the new message away as a duplicate of the old one.  A
+/// message we originated needs no de-duplication in the first place; the path
+/// is kept only because it is what links the row to the modem's object.
+fn outgoing_sms_id(path: &OwnedObjectPath) -> String {
+    format!("{}|{}", path.as_str(), crate::db::now_iso())
+}
+
 /// Keep digits and the few characters that are meaningful for dialling.
 pub fn sanitize_number(raw: &str) -> String {
     let raw = raw.trim();
@@ -1809,6 +1968,19 @@ mod tests {
         assert_eq!(sanitize_number("+82 10-1234-5678"), "+821012345678");
         assert_eq!(sanitize_number("tel:0212345678"), "0212345678");
         assert_eq!(sanitize_number("*123#"), "*123#");
+    }
+
+    /// The MMS sender is free-form text decoded from a PDU whoever sent the
+    /// message wrote, and it goes into the From header of the MESSAGE the
+    /// gateway then sends to its own SIP peer.
+    #[test]
+    fn a_sender_cannot_smuggle_headers_through_the_number() {
+        assert_eq!(
+            sanitize_number("0100\r\nContact: <sip:evil@h>\r\nSubject: pwned"),
+            "0100"
+        );
+        assert_eq!(sanitize_number("someone@example.com"), "");
+        assert!(sanitize_number("\r\n\r\n").is_empty());
     }
 
     #[test]
@@ -1857,6 +2029,7 @@ mod tests {
             remote_sdp: None,
             media_dtmf_pt: None,
             answered: true,
+            auth_retried: false,
             ringing_sent: true,
             early_media: false,
             cdr_id: None,

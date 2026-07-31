@@ -30,6 +30,12 @@ impl Transport {
         self.bound
     }
 
+    /// A handle on the socket for tasks that outlive the call that made them
+    /// (the 2xx retransmission timer).
+    pub fn socket(&self) -> Arc<UdpSocket> {
+        self.sock.clone()
+    }
+
     pub fn port(&self) -> u16 {
         self.bound.port()
     }

@@ -23,9 +23,11 @@ pub async fn run(core: Arc<SipCore>) {
     // Call-ID accumulate a new binding per refresh otherwise.
     let call_id = format!("{}@modem2sip", auth::random_hex(10));
     let local_tag = auth::random_hex(6);
+    // What we ask for, which a registrar with a higher minimum can raise.
+    let mut asked_for = up.expires;
 
     loop {
-        match register_once(&core, &up, &call_id, &local_tag).await {
+        match register_once(&core, &up, &call_id, &local_tag, &mut asked_for).await {
             Ok(expires) => {
                 backoff = Duration::from_secs(2);
                 // Refresh at ~80% of the granted lifetime, but never after it
@@ -52,6 +54,7 @@ async fn register_once(
     up: &crate::config::Upstream,
     call_id: &str,
     local_tag: &str,
+    expires: &mut u32,
 ) -> Result<u32> {
     let registrar_uri =
         Uri::parse(&up.registrar).ok_or_else(|| anyhow!("invalid registrar URI"))?;
@@ -79,13 +82,33 @@ async fn register_once(
     contact.set_param("transport", Some("udp"));
     let our_contact = contact.bare();
     req.headers.set("contact", NameAddr::new(contact).to_string());
-    req.headers.set("expires", up.expires.to_string());
+    req.headers.set("expires", expires.to_string());
     req.headers.set("allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, INFO, MESSAGE");
 
     let resp = core
         .transact(req, dest, Some((&up.username, &up.password)), Duration::from_secs(32))
         .await?;
 
+    // RFC 3261 §10.2.8: the registrar states its minimum in Min-Expires and
+    // expects the request again with at least that.  Treating it as a plain
+    // failure meant a registrar with a floor above `sip.register.expires`
+    // could never be registered with at all, only retried against forever.
+    if resp.code == 423 {
+        let min = resp
+            .headers
+            .get("min-expires")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|m| *m > *expires)
+            .ok_or_else(|| anyhow!("423 Interval Too Brief without a usable Min-Expires"))?;
+        warn!(
+            registrar = %up.registrar,
+            asked_for = *expires,
+            min,
+            "the registrar wants a longer registration; using its minimum from now on"
+        );
+        *expires = min;
+        return Err(anyhow!("retrying with the registrar's minimum expiry of {min}s"));
+    }
     if !resp.is_success() {
         return Err(anyhow!("registrar replied {} {}", resp.code, resp.reason));
     }
@@ -100,7 +123,7 @@ async fn register_once(
         .find(|c| c.uri.bare() == our_contact)
         .and_then(|c| c.param("expires").and_then(|v| v.trim().parse::<u32>().ok()))
         .or_else(|| resp.headers.get("expires").and_then(|v| v.trim().parse::<u32>().ok()))
-        .unwrap_or(up.expires);
+        .unwrap_or(*expires);
     if granted == 0 {
         // A 200 that grants nothing is a refusal dressed as success; backing
         // off is right, re-registering immediately is a flood.

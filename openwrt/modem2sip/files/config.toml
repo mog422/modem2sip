@@ -45,6 +45,8 @@ password = "change-me"
 [rtp]
 port_min = 16384
 port_max = 16484
+# End a call whose SIP peer stopped sending RTP; 0 disables the check.
+timeout_secs = 60
 # On a VoLTE call the network refuses the modem's DTMF request, so "auto"
 # falls back to generating the tones into the uplink audio.
 dtmf_method        = "auto"

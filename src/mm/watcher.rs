@@ -44,12 +44,20 @@ pub async fn run(cfg: Arc<Config>, tx: mpsc::Sender<ModemEvent>) {
     loop {
         match Connection::system().await {
             Ok(conn) => {
-                backoff = Duration::from_secs(1);
                 info!("connected to the system bus");
+                let connected_at = tokio::time::Instant::now();
                 if let Err(e) = session(&cfg, conn, &tx).await {
                     warn!(error = %format!("{e:#}"), "ModemManager session ended");
                 }
                 let _ = tx.send(ModemEvent::Down { reason: "bus session ended".into() }).await;
+                // Resetting the backoff on a successful *connect* undoes it
+                // entirely when the failure comes just after connecting -
+                // ModemManager restarting in a loop, say - and turns this
+                // into a reconnect flood.  Only a session that actually
+                // lasted counts as progress.
+                if connected_at.elapsed() > Duration::from_secs(30) {
+                    backoff = Duration::from_secs(1);
+                }
             }
             Err(e) => {
                 warn!(error = %format!("{e:#}"), "cannot connect to the system bus, retrying");

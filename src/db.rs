@@ -175,6 +175,32 @@ impl Db {
         .await?
     }
 
+    /// The row a previous copy of this message was stored as, with its status.
+    ///
+    /// Used to tell a re-announcement apart from a re-delivery that still
+    /// needs work: an MMS notification the carrier repeats because the body
+    /// was never fetched has the same identity as the one already stored.
+    pub async fn find_by_external_id(
+        &self,
+        kind: &'static str,
+        direction: Direction,
+        external_id: &str,
+    ) -> Result<Option<(i64, String)>> {
+        let external_id = external_id.to_string();
+        self.with_conn(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT id, status FROM messages
+                      WHERE kind = ?1 AND direction = ?2 AND external_id = ?3",
+                    params![kind, direction.as_str(), external_id],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await
+    }
+
     /// Insert a message.  Returns `None` when `external_id` was already
     /// stored (the modem re-announcing a message after a restart).
     pub async fn insert_message(&self, msg: NewMessage) -> Result<Option<i64>> {

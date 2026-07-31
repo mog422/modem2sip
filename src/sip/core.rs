@@ -110,6 +110,11 @@ pub struct SipCore {
     /// Highest nonce-count seen per issued nonce, so a captured Authorization
     /// header cannot simply be replayed.
     nonce_seen: Mutex<HashMap<String, (u32, Instant)>>,
+    /// 2xx answers to an INVITE that are still waiting for their ACK, keyed
+    /// by Call-ID and the INVITE's sequence number.  Setting the flag stops
+    /// the retransmission timer.  Shared with those timers, which drop their
+    /// own entry when they give up.
+    pending_ack: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     events: mpsc::Sender<SipEvent>,
     /// Whether the modem is usable right now; drives 503 responses.
     modem_ready: Arc<AtomicBool>,
@@ -139,6 +144,7 @@ impl SipCore {
             client_txns: Mutex::new(HashMap::new()),
             server_cache: Mutex::new(HashMap::new()),
             nonce_seen: Mutex::new(HashMap::new()),
+            pending_ack: Arc::new(Mutex::new(HashMap::new())),
             events,
             modem_ready,
             cseq: AtomicU32::new(1),
@@ -232,7 +238,16 @@ impl SipCore {
                 "response method does not match the transaction, dropped"
             ),
             Some(entry) => {
-                entry.stop_retransmit.store(true, Ordering::Relaxed);
+                // RFC 3261 §17.1.2.2: a non-INVITE transaction keeps
+                // retransmitting after a provisional, because the server side
+                // only re-sends its final answer when it sees the request
+                // again.  Stopping on a 100 Trying from a proxy meant a lost
+                // final response was never recovered - the SMS or the
+                // registration simply timed out.  For an INVITE the
+                // provisional is the signal to stop.
+                if resp.code >= 200 || entry.method == Method::Invite {
+                    entry.stop_retransmit.store(true, Ordering::Relaxed);
+                }
                 let _ = entry.tx.send(resp);
             }
             None => debug!(%branch, code = resp.code, "response for unknown transaction"),
@@ -244,6 +259,19 @@ impl SipCore {
             warn!(%src, "request from disallowed source, 403");
             self.respond(&req, src, self.make_response(&req, 403, None)).await?;
             return Ok(());
+        }
+
+        // The ACK is what tells us the 2xx arrived; until it does, that
+        // response is retransmitted.  It carries the INVITE's sequence
+        // number, so it identifies the answer it acknowledges even though it
+        // is a transaction of its own.
+        if req.method == Method::Ack {
+            if let Some(key) = dialog_key(&req) {
+                if let Some(stop) = self.pending_ack.lock().unwrap().remove(&key) {
+                    debug!(%key, "ACK received; the 2xx is confirmed");
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
         }
 
         // Retransmission handling.  Answering a request twice is not just
@@ -492,6 +520,16 @@ impl SipCore {
     pub fn make_response(&self, req: &Request, code: u16, reason: Option<&str>) -> Response {
         let mut resp = req.reply(code, reason.unwrap_or_else(|| reason_phrase(code)));
         resp.headers.set("user-agent", self.cfg.sip.user_agent.clone());
+        // RFC 3261 §8.2.6.2: every response except a 100 Trying carries a To
+        // tag - it is half of what identifies the dialog, and peers that take
+        // that seriously reject a final response without one.  A call the
+        // gateway tracks overwrites this with the tag it stored for the
+        // dialog; everything else needs one generated here.
+        if code != 100 {
+            if let Some(to) = resp.headers.to().filter(|t| t.tag().is_none()) {
+                resp.headers.set("to", to.with_tag(&auth::random_hex(6)).to_string());
+            }
+        }
         resp
     }
 
@@ -500,12 +538,25 @@ impl SipCore {
     pub async fn respond(&self, req: &Request, src: SocketAddr, mut resp: Response) -> Result<()> {
         // RFC 3581: reflect the source in the topmost Via.
         if let Some(raw) = resp.headers.get("via").map(str::to_string) {
-            if let Some(mut via) = Via::parse(&raw) {
+            // One Via header field may hold several comma separated values
+            // (RFC 3261 §7.3.1), and only the first of them is ours to
+            // annotate.  Replacing the whole field with just that one threw
+            // the others away, and a proxy that folds its Vias then had
+            // nothing left to route the response back through.
+            let (first, rest) = match raw.split_once(',') {
+                Some((f, r)) => (f, Some(r)),
+                None => (raw.as_str(), None),
+            };
+            if let Some(mut via) = Via::parse(first) {
                 via.set_param("received", Some(&src.ip().to_string()));
                 if via.has_param("rport") {
                     via.set_param("rport", Some(&src.port().to_string()));
                 }
-                resp.headers.replace_first("via", via.to_string());
+                let value = match rest {
+                    Some(rest) => format!("{via},{rest}"),
+                    None => via.to_string(),
+                };
+                resp.headers.replace_first("via", value);
             }
         }
         if resp.headers.get("contact").is_none() && resp.code < 300 && resp.code != 100 {
@@ -529,7 +580,55 @@ impl SipCore {
                 *provisional = Some(bytes.clone());
             }
         }
+
+        // RFC 3261 §13.3.1.4: the 2xx that answers an INVITE is the one
+        // response nothing else will recover.  The caller stopped
+        // retransmitting when it got our 100, and a 2xx ends the transaction,
+        // so if this datagram is lost the caller waits in "ringing" while the
+        // mobile leg is connected and billed.  Repeat it until the ACK comes.
+        if req.method == Method::Invite && (200..300).contains(&resp.code) {
+            self.retransmit_until_acked(req, bytes.clone(), src);
+        }
+
         self.transport.send(&bytes, src).await
+    }
+
+    /// Keep re-sending a 2xx answer to an INVITE until it is acknowledged.
+    fn retransmit_until_acked(&self, req: &Request, bytes: Vec<u8>, dest: SocketAddr) {
+        let Some(key) = dialog_key(req) else { return };
+        let stop = Arc::new(AtomicBool::new(false));
+        // A re-INVITE answered while the first 2xx is still unacknowledged
+        // replaces it: only the newest answer is worth repeating.
+        if let Some(previous) = self.pending_ack.lock().unwrap().insert(key.clone(), stop.clone()) {
+            previous.store(true, Ordering::Relaxed);
+        }
+
+        let sock = self.transport.socket();
+        let pending = self.pending_ack.clone();
+        tokio::spawn(async move {
+            let mut delay = Duration::from_millis(500);
+            let mut elapsed = Duration::ZERO;
+            while elapsed < Duration::from_secs(32) {
+                tokio::time::sleep(delay).await;
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if sock.send_to(&bytes, dest).await.is_err() {
+                    break;
+                }
+                elapsed += delay;
+                delay = (delay * 2).min(Duration::from_secs(4));
+            }
+            if !stop.load(Ordering::Relaxed) {
+                warn!(%key, "no ACK for the 2xx after 32s; giving up on retransmitting it");
+            }
+            // Only our own entry: a re-INVITE may have replaced it, and that
+            // newer answer is still waiting for an ACK of its own.
+            let mut map = pending.lock().unwrap();
+            if map.get(&key).map(|s| Arc::ptr_eq(s, &stop)).unwrap_or(false) {
+                map.remove(&key);
+            }
+        });
     }
 
     /// Send a request and return a handle to its transaction.
@@ -737,6 +836,17 @@ fn split_contacts(field: &str) -> Vec<String> {
     out
 }
 
+/// Identity shared by an INVITE and the ACK that confirms its 2xx.
+///
+/// The ACK for a 2xx is a transaction of its own with a branch of its own, so
+/// it cannot be matched on the branch; what it does carry is the Call-ID and
+/// the INVITE's sequence number.
+fn dialog_key(req: &Request) -> Option<String> {
+    let call_id = req.headers.call_id()?;
+    let (cseq, _) = req.headers.cseq()?;
+    Some(format!("{call_id}|{cseq}"))
+}
+
 /// Transaction identity for server-side retransmission detection.
 fn txn_key(req: &Request) -> Option<String> {
     let branch = req.headers.top_via().and_then(|v| v.branch().map(str::to_string))?;
@@ -812,6 +922,38 @@ mod tests {
         );
         assert_eq!(split_contacts("<sip:a@h;x=1,2>"), vec!["<sip:a@h;x=1,2>"]);
         assert!(split_contacts("  ").is_empty());
+    }
+
+    /// The ACK for a 2xx is a transaction of its own with a branch of its
+    /// own, so the 2xx it confirms can only be found through the Call-ID and
+    /// the INVITE's sequence number.
+    #[test]
+    fn an_ack_is_matched_to_the_invite_it_confirms() {
+        let raw = |method: &str, call_id: &str, cseq: u32| {
+            let text = format!(
+                "{method} sip:x@gw SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bK{cseq}{method}\r\n\
+                 From: <sip:a@h>;tag=1\r\nTo: <sip:x@gw>;tag=2\r\nCall-ID: {call_id}\r\n\
+                 CSeq: {cseq} {method}\r\n\r\n"
+            );
+            match Message::parse(text.as_bytes()).unwrap() {
+                Message::Request(r) => r,
+                _ => panic!("expected a request"),
+            }
+        };
+        // Different branches, same dialog and sequence number: a match.
+        assert_eq!(
+            dialog_key(&raw("INVITE", "call-1", 7)),
+            dialog_key(&raw("ACK", "call-1", 7))
+        );
+        // An ACK for a different call or a different INVITE is not.
+        assert_ne!(
+            dialog_key(&raw("INVITE", "call-1", 7)),
+            dialog_key(&raw("ACK", "call-2", 7))
+        );
+        assert_ne!(
+            dialog_key(&raw("INVITE", "call-1", 7)),
+            dialog_key(&raw("ACK", "call-1", 8))
+        );
     }
 
     /// A CANCEL reuses the INVITE's branch, so the transaction key has to

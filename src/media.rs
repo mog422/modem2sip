@@ -6,7 +6,7 @@
 //! behaviour a jitter buffer needs.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,10 +23,45 @@ use crate::sip::sdp::Codec;
 
 pub struct MediaSession {
     pub remote: Arc<Mutex<SocketAddr>>,
+    /// Where the signalling says the peer is, and whether the receiver has
+    /// latched onto the address the packets actually come from.  Separate
+    /// from `remote`, which symmetric RTP overwrites with the observed
+    /// source: the receiver has to keep checking against what was signalled.
+    signalled: Arc<Mutex<Signalled>>,
+    clock: Arc<Clock>,
     rings: Arc<AudioRings>,
     stop: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<()>>,
     audio: Option<AudioStream>,
+}
+
+struct Signalled {
+    addr: SocketAddr,
+    latched: bool,
+}
+
+/// Milliseconds since the session started, for the inactivity check.  An
+/// `Instant` cannot live in an atomic, and the receiver has to be able to
+/// stamp this without taking a lock on every packet.
+struct Clock {
+    started: std::time::Instant,
+    last_rtp_ms: AtomicU64,
+}
+
+impl Clock {
+    fn new() -> Self {
+        Self { started: std::time::Instant::now(), last_rtp_ms: AtomicU64::new(0) }
+    }
+    fn stamp(&self) {
+        self.last_rtp_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+    /// How long since the last RTP packet, counting from the session start
+    /// while none has arrived at all.
+    fn since_last_rtp(&self) -> Duration {
+        let now = self.started.elapsed().as_millis() as u64;
+        Duration::from_millis(now.saturating_sub(self.last_rtp_ms.load(Ordering::Relaxed)))
+    }
 }
 
 pub struct MediaConfig {
@@ -79,6 +114,8 @@ impl MediaSession {
         let payload_type = cfg.codec.payload_type();
         let rings = audio.rings.clone();
         let stop = Arc::new(AtomicBool::new(false));
+        let signalled = Arc::new(Mutex::new(Signalled { addr: remote, latched: false }));
+        let clock = Arc::new(Clock::new());
         let remote = Arc::new(Mutex::new(remote));
         let sock = Arc::new(sock);
 
@@ -102,6 +139,8 @@ impl MediaSession {
             tokio::spawn(receiver_loop(
                 sock,
                 remote.clone(),
+                signalled.clone(),
+                clock.clone(),
                 rings,
                 stop.clone(),
                 law,
@@ -112,7 +151,7 @@ impl MediaSession {
             )),
         ];
 
-        Self { remote, rings: audio.rings.clone(), stop, tasks, audio: Some(audio) }
+        Self { remote, signalled, clock, rings: audio.rings.clone(), stop, tasks, audio: Some(audio) }
     }
 
     /// Play DTMF digits into the uplink audio.  Used when the modem cannot
@@ -139,9 +178,31 @@ impl MediaSession {
         queued
     }
 
-    /// Point the sender at a new destination (re-INVITE / late SDP).
+    /// Point the session at a new destination (re-INVITE / late SDP).
+    ///
+    /// The receiver only accepts audio from the host the signalling named, so
+    /// a peer that re-homes its media has to move that expectation too - it
+    /// used to keep checking against the original address, and every packet
+    /// from the new one was dropped for the rest of the call.  Moving to a
+    /// different host also clears the symmetric-RTP latch, so the new
+    /// endpoint's own source port can be learned.
     pub fn set_remote(&self, addr: SocketAddr) {
+        let mut signalled = self.signalled.lock().unwrap();
+        if signalled.addr.ip() != addr.ip() {
+            signalled.latched = false;
+        }
+        signalled.addr = addr;
         *self.remote.lock().unwrap() = addr;
+    }
+
+    /// How long the peer has been silent at the RTP level.
+    ///
+    /// A SIP peer that dies without a BYE - a PBX that is restarted, a
+    /// network that goes away - leaves the mobile leg connected and billed
+    /// for as long as the process runs, because nothing else on either side
+    /// ever notices.  Its RTP stops immediately, so that is what is watched.
+    pub fn silence(&self) -> Duration {
+        self.clock.since_last_rtp()
     }
 
     pub fn audio_failed(&self) -> bool {
@@ -276,6 +337,8 @@ async fn sender_loop(
 async fn receiver_loop(
     sock: Arc<UdpSocket>,
     remote: Arc<Mutex<SocketAddr>>,
+    signalled: Arc<Mutex<Signalled>>,
+    clock: Arc<Clock>,
     rings: Arc<AudioRings>,
     stop: Arc<AtomicBool>,
     law: Law,
@@ -286,9 +349,7 @@ async fn receiver_loop(
 ) {
     let mut buf = vec![0u8; 2048];
     let mut pcm = Vec::with_capacity(320);
-    let mut latched = false;
     let mut last_dtmf_ts: Option<u32> = None;
-    let signalled = *remote.lock().unwrap();
 
     while !stop.load(Ordering::Relaxed) {
         let (len, src) = match sock.recv_from(&mut buf).await {
@@ -303,21 +364,16 @@ async fn receiver_loop(
             }
         };
 
-        // Only the host we signalled with gets to be heard.  The port is
+        // Only the host the signalling named gets to be heard.  The port is
         // allowed to differ - that is what makes RTP work behind NAT - but a
         // completely unrelated host must not be able to take over the call
-        // audio by winning a race with the peer's first packet.
-        if !signalled.ip().is_unspecified() && src.ip() != signalled.ip() {
-            trace!(from = %src, expected = %signalled, "ignoring RTP from an unexpected host");
+        // audio by winning a race with the peer's first packet.  Re-read on
+        // every packet: a re-INVITE may have moved the peer since the session
+        // started, and audio from where it moved to has to be accepted.
+        let expected = signalled.lock().unwrap().addr;
+        if !expected.ip().is_unspecified() && src.ip() != expected.ip() {
+            trace!(from = %src, %expected, "ignoring RTP from an unexpected host");
             continue;
-        }
-        // Symmetric RTP: reply to wherever the peer actually turned out to be.
-        if symmetric && !latched {
-            if src != signalled {
-                debug!(from = %src, previous = %signalled, "latching remote RTP address");
-                *remote.lock().unwrap() = src;
-            }
-            latched = true;
         }
 
         if len < 12 {
@@ -327,6 +383,24 @@ async fn receiver_loop(
         if header[0] >> 6 != 2 {
             continue;
         }
+        // Anything that parses as RTP from the expected host counts as the
+        // peer being alive, whether or not we can decode its payload type.
+        clock.stamp();
+
+        // Symmetric RTP: reply to wherever the peer actually turned out to
+        // be.  Done only once the datagram has proved to be RTP, so a stray
+        // packet cannot redirect the call audio.
+        if symmetric {
+            let mut state = signalled.lock().unwrap();
+            if !state.latched {
+                if src != state.addr {
+                    debug!(from = %src, previous = %state.addr, "latching remote RTP address");
+                    *remote.lock().unwrap() = src;
+                }
+                state.latched = true;
+            }
+        }
+
         let csrc_count = (header[0] & 0x0F) as usize;
         let has_extension = header[0] & 0x10 != 0;
         let has_padding = header[0] & 0x20 != 0;

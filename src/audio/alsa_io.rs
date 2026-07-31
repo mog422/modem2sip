@@ -192,19 +192,31 @@ impl AudioStream {
         let stream = Self { rings, failed, stop, threads };
 
         // Both threads must report success, otherwise the call is not viable.
-        // Whichever one did open has to be shut down and joined before we
-        // give up, or it keeps holding the card and the next call gets EBUSY
-        // from a modem that then looks permanently broken.
+        // Whichever one did open has to be shut down before we give up, or it
+        // keeps holding the card and the next call gets EBUSY from a modem
+        // that then looks permanently broken.
         for _ in 0..2 {
-            let failure = match ready_rx.recv_timeout(OPEN_TIMEOUT) {
+            let (failure, timed_out) = match ready_rx.recv_timeout(OPEN_TIMEOUT) {
                 Ok(Ok((direction, rate))) => {
                     info!(direction, rate, "modem audio open");
                     continue;
                 }
-                Ok(Err(e)) => anyhow!("{e}"),
-                Err(_) => anyhow!("timed out opening the modem sound card"),
+                Ok(Err(e)) => (anyhow!("{e}"), false),
+                Err(_) => (anyhow!("timed out opening the modem sound card"), true),
             };
-            stream.shutdown();
+            if timed_out {
+                // A thread that has not reported is still inside a blocking
+                // snd_pcm_open, where it cannot see `stop` - joining it would
+                // wait exactly as long as the open does (on a wedged USB
+                // audio function, forever) and take the gateway's event loop
+                // down with it, since this runs on a blocking-pool task the
+                // loop is awaiting.  Let them finish on their own instead:
+                // they see `stop` as soon as the open returns and exit.
+                warn!("the modem sound card did not open in time; abandoning the audio threads");
+                stream.detach();
+            } else {
+                stream.shutdown();
+            }
             return Err(failure);
         }
         Ok(stream)
@@ -222,6 +234,15 @@ impl AudioStream {
             let _ = t.join();
         }
         debug!("modem audio closed");
+    }
+
+    /// Ask the threads to stop but do not wait for them.
+    ///
+    /// Only for the open timeout: a thread stuck in `snd_pcm_open` cannot see
+    /// `stop` until the call returns, so joining it has no deadline.
+    fn detach(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        std::mem::take(&mut self.threads);
     }
 }
 

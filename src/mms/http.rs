@@ -58,6 +58,13 @@ struct Url {
 }
 
 fn parse_url(url: &str) -> Result<Url> {
+    // The URL is the X-Mms-Content-Location of an inbound notification, i.e.
+    // a string an SMS sender chose.  It is concatenated into the request line
+    // and, with a proxy configured, sent verbatim - so a CR or LF in it would
+    // append requests of the sender's choosing to the one we meant to make.
+    if url.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        bail!("MMS URL contains control characters");
+    }
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| {
@@ -455,5 +462,21 @@ mod tests {
 
         assert!(parse_url("https://mmsc.example/x").is_err());
         assert!(parse_url("http:///x").is_err());
+    }
+
+    /// The URL comes out of an inbound SMS and is written straight into the
+    /// request line, so a CR or LF in it used to smuggle a second request to
+    /// the carrier's MMSC.
+    #[test]
+    fn urls_with_control_characters_are_refused() {
+        for bad in [
+            "http://mmsc.example/x\r\nX-Injected: 1",
+            "http://mmsc.example/x\nX-Injected: 1",
+            "http://mmsc.example\r\nHost: evil/x",
+            "http://mmsc.example/\u{7f}",
+        ] {
+            assert!(parse_url(bad).is_err(), "accepted {bad:?}");
+        }
+        assert!(parse_url("http://mmsc.example/oma?id=1").is_ok());
     }
 }
