@@ -184,14 +184,35 @@ URC port is `usbat`. Stealing URCs from ModemManager would be unreliable in
 both directions, so the gateway detects the same tones in the audio instead.
 That branch does not change the *send* direction; it still uses `AT+VTS`.
 
+### Marking messages: `messagetype=sms`
+
+Everything the gateway hands to SIP carries `messagetype=sms` as a URI
+parameter, on both the Request-URI and the To header:
+
+```
+MESSAGE sip:phone1@192.168.1.10:5060;messagetype=sms SIP/2.0
+To: <sip:phone1@192.168.1.10:5060;messagetype=sms>
+Content-Type: text/plain
+```
+
+The same marker is **required** on anything the gateway is asked to send. A
+`MESSAGE` whose Request-URI or To header does not say `messagetype=sms` is
+rejected with `415 Unsupported Media Type` and nothing goes on the air, so a
+message meant for some other purpose can never be turned into an SMS by
+accident. The parameter is read from either place and matched
+case-insensitively.
+
+This applies to MMS submissions over SIP too. The HTTP API is a separate
+interface and is unaffected.
+
 ### SMS
 
 Incoming messages are stored in SQLite and forwarded as a SIP `MESSAGE`
 (`text/plain`) whose `From` user part is the sender's number. They are deleted
 from the modem/SIM only after the database write succeeds.
 
-Sending: a SIP `MESSAGE` to `sip:<number>@gateway` with a `text/plain` body,
-or `POST /sms {"to": "...", "text": "..."}`. Segmentation and GSM7/UCS2
+Sending: a SIP `MESSAGE` to `sip:<number>@gateway;messagetype=sms` with a
+`text/plain` body, or `POST /sms {"to": "...", "text": "..."}`. Segmentation and GSM7/UCS2
 encoding are ModemManager's job.
 
 ### MMS

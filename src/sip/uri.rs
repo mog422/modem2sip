@@ -88,6 +88,14 @@ impl Uri {
         Some(Uri { scheme, user, password, host, port, params, headers: hdrs })
     }
 
+    /// URI parameter, e.g. `transport` or `messagetype`.
+    pub fn param(&self, name: &str) -> Option<&str> {
+        self.params
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .and_then(|(_, v)| v.as_deref())
+    }
+
     pub fn set_param(&mut self, name: &str, value: Option<&str>) {
         self.params.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
         self.params.push((name.to_string(), value.map(|v| v.to_string())));
@@ -264,6 +272,21 @@ mod tests {
         assert_eq!(u.port, Some(5062));
         assert_eq!(u.params, vec![("transport".into(), Some("udp".into())),
                                   ("user".into(), Some("phone".into()))]);
+    }
+
+    #[test]
+    fn uri_parameters_survive_a_round_trip() {
+        let mut u = Uri::parse("sip:01012345678@gw.test").unwrap();
+        u.set_param("messagetype", Some("sms"));
+        let text = u.to_string();
+        assert_eq!(text, "sip:01012345678@gw.test;messagetype=sms");
+
+        let back = Uri::parse(&text).unwrap();
+        assert_eq!(back.param("messagetype"), Some("sms"));
+        assert_eq!(back.user.as_deref(), Some("01012345678"));
+        // Parameters are matched case-insensitively by name.
+        assert_eq!(Uri::parse("sip:a@b;MessageType=sms").unwrap().param("messagetype"), Some("sms"));
+        assert_eq!(back.bare().param("messagetype"), None);
     }
 
     #[test]

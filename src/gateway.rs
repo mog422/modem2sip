@@ -26,6 +26,13 @@ use crate::sip::transport;
 use crate::sip::uri::{NameAddr, Uri};
 use crate::state::Shared;
 
+/// Messages crossing the SIP boundary carry `messagetype=sms` on the
+/// Request-URI and the To header: it is set on everything the gateway sends
+/// out, and required on everything it is asked to send, so that a MESSAGE
+/// meant for something else is never put on the air.
+const MESSAGE_TYPE_PARAM: &str = "messagetype";
+const MESSAGE_TYPE_SMS: &str = "sms";
+
 /// Events the gateway generates for itself (responses to its own requests,
 /// timers, ...).
 #[derive(Debug)]
@@ -780,15 +787,35 @@ impl Gateway {
 
     /// SIP MESSAGE: send an SMS (text/plain) or an MMS (JSON body).
     async fn on_sip_message(&mut self, req: Request, src: SocketAddr) -> Result<()> {
-        let Some(modem) = self.modem.clone() else {
-            return self.reply(&req, src, 503).await;
-        };
-        let content_type = req.headers.content_type().unwrap_or("text/plain").to_string();
         let to = req
             .headers
             .to()
             .map(|t| t.uri)
             .unwrap_or_else(|| req.uri.clone());
+
+        // Only messages explicitly marked as SMS are put on the air.  The
+        // marker is accepted on either the Request-URI or the To header,
+        // because that is where it can legitimately appear.
+        let declared = req
+            .uri
+            .param(MESSAGE_TYPE_PARAM)
+            .or_else(|| to.param(MESSAGE_TYPE_PARAM))
+            .map(|v| v.to_string());
+        match declared.as_deref() {
+            Some(v) if v.eq_ignore_ascii_case(MESSAGE_TYPE_SMS) => {}
+            other => {
+                info!(
+                    messagetype = other.unwrap_or("<absent>"),
+                    "rejecting MESSAGE: not marked as {MESSAGE_TYPE_PARAM}={MESSAGE_TYPE_SMS}"
+                );
+                return self.reply(&req, src, 415).await;
+            }
+        }
+
+        let Some(modem) = self.modem.clone() else {
+            return self.reply(&req, src, 503).await;
+        };
+        let content_type = req.headers.content_type().unwrap_or("text/plain").to_string();
         let number = sanitize_number(to.user.as_deref().unwrap_or(""));
 
         if content_type.contains("json") {
@@ -1484,13 +1511,15 @@ pub async fn notify_sip_message(
         .sms_target
         .clone()
         .or_else(|| shared.cfg.sip.call_target.clone());
-    let (target_uri, addr) = match resolve_target(&core, target_cfg.as_deref()).await {
+    let (mut target_uri, addr) = match resolve_target(&core, target_cfg.as_deref()).await {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %format!("{e:#}"), "no SIP destination for the incoming message");
             return;
         }
     };
+    // Mark what this is, on both the Request-URI and the To header.
+    target_uri.set_param(MESSAGE_TYPE_PARAM, Some(MESSAGE_TYPE_SMS));
 
     let domain = core.domain();
     let from_user = if peer.is_empty() { "unknown".to_string() } else { peer.to_string() };
@@ -1500,7 +1529,9 @@ pub async fn notify_sip_message(
         params: Vec::new(),
     }
     .with_tag(&crate::sip::auth::random_hex(6));
-    let to = NameAddr::new(target_uri.bare());
+    let mut to_uri = target_uri.bare();
+    to_uri.set_param(MESSAGE_TYPE_PARAM, Some(MESSAGE_TYPE_SMS));
+    let to = NameAddr::new(to_uri);
     let call_id = format!("{}@modem2sip", crate::sip::auth::random_hex(10));
 
     let mut req = core.build_request(
