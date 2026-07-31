@@ -6,9 +6,10 @@ pub mod watcher;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tracing::debug;
+use tracing::{debug, warn};
 use zbus::Connection;
 use zvariant::{OwnedObjectPath, Value};
 
@@ -149,7 +150,9 @@ impl ModemHandle {
         let path = self.voice.create_call(props).await.context("Voice.CreateCall")?;
         let call = self.call_proxy(&path).await?;
         if let Err(e) = call.start().await {
-            let _ = self.voice.delete_call(&path).await;
+            // The object exists even though the call never went out, and
+            // leaving it behind is what makes the next attempt fail too.
+            self.release_call(&path, &call).await;
             return Err(anyhow::anyhow!("Call.Start failed: {e}"));
         }
         Ok(path)
@@ -160,14 +163,51 @@ impl ModemHandle {
         Ok(())
     }
 
+    /// Hang the call up and remove its object from ModemManager.
+    ///
+    /// The deletion cannot be fired off and forgotten.  `Call.Hangup` only
+    /// *starts* the transition to `terminated`, and ModemManager refuses to
+    /// delete a call that has not got there yet - so deleting immediately
+    /// afterwards fails, the object stays behind, and the modem answers the
+    /// next `Call.Start` with `IncompatibleState`.  From the outside that
+    /// looks like a cancel being ignored: the cancelled call does end, but
+    /// the one after it never goes out.
     pub async fn hangup(&self, path: &OwnedObjectPath) -> Result<()> {
         let call = self.call_proxy(path).await?;
-        // Hangup on an already terminated call is harmless but noisy.
+        // Hanging up an already terminated call is harmless but noisy.
         if let Err(e) = call.hangup().await {
             debug!(error = %e, "Call.Hangup failed (already gone?)");
         }
-        let _ = self.voice.delete_call(path).await;
+        self.release_call(path, &call).await;
         Ok(())
+    }
+
+    /// Remove a call object that has already finished.
+    pub async fn delete_call(&self, path: &OwnedObjectPath) {
+        if let Err(e) = self.voice.delete_call(path).await {
+            debug!(path = path.as_str(), error = %e, "Voice.DeleteCall failed");
+        }
+    }
+
+    /// Wait for the call to settle and then delete its object.
+    async fn release_call(&self, path: &OwnedObjectPath, call: &CallProxy<'_>) {
+        if !wait_terminated(call).await {
+            // The modem still believes it has a call.  Hanging up everything
+            // is what clears that by hand, and one process owns one modem, so
+            // there is no other call of ours to disturb.
+            warn!(path = path.as_str(), "the modem call will not end; hanging up everything");
+            if let Err(e) = self.voice.hangup_all().await {
+                warn!(error = %e, "Voice.HangupAll failed");
+            }
+            wait_terminated(call).await;
+        }
+        if let Err(e) = self.voice.delete_call(path).await {
+            warn!(
+                path = path.as_str(),
+                error = %e,
+                "could not delete the modem call object; the next call may be refused"
+            );
+        }
     }
 
     pub async fn send_dtmf(&self, path: &OwnedObjectPath, digits: &str) -> Result<()> {
@@ -264,6 +304,30 @@ impl ModemHandle {
             return Some(BearerNet { interface, address, dns });
         }
         None
+    }
+}
+
+/// How long to give a call to reach `terminated` before forcing the issue.
+const TERMINATE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// True once the call reports `terminated`, or has gone from the bus.
+///
+/// The state is polled rather than awaited as a signal: this runs inside the
+/// gateway's single event loop, which is also what delivers `CallState`, so
+/// waiting for the event here would wait forever.
+async fn wait_terminated(call: &CallProxy<'_>) -> bool {
+    let deadline = tokio::time::Instant::now() + TERMINATE_TIMEOUT;
+    loop {
+        match call.state().await {
+            Ok(s) if s == call_state::TERMINATED => return true,
+            // Already gone, which is what we were waiting for.
+            Err(_) => return true,
+            Ok(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

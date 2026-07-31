@@ -229,17 +229,37 @@ impl Gateway {
 
     async fn on_mm_call_added(&mut self, path: OwnedObjectPath) -> Result<()> {
         let Some(modem) = self.modem.clone() else { return Ok(()) };
-        let info = modem.call_info(&path).await?;
 
         // Our own outgoing call, already tracked.
         if self.call.as_ref().and_then(|c| c.mm_path.clone()).as_ref() == Some(&path) {
             return Ok(());
         }
-        if info.direction != call_state::DIR_INCOMING {
-            debug!(path = path.as_str(), "ignoring non-incoming call object");
+        let Ok(info) = modem.call_info(&path).await else {
+            // A call we just cleaned up after a failed dial; the signal for it
+            // arrives once the object has already gone.
+            debug!(path = path.as_str(), "call object vanished before it could be read");
+            return Ok(());
+        };
+
+        if matches!(info.state, call_state::TERMINATED) {
+            // A finished call ModemManager still lists.  Nothing owns it and
+            // nothing will delete it later, and every one left behind is
+            // another record the modem carries into the next call.
+            debug!(path = path.as_str(), "deleting a call object that has already ended");
+            modem.delete_call(&path).await;
             return Ok(());
         }
-        if matches!(info.state, call_state::TERMINATED) {
+        if info.direction != call_state::DIR_INCOMING {
+            // Outgoing, but not the call this process is running - so it is
+            // left over from a previous run, still up on the network and
+            // holding the modem.
+            warn!(
+                path = path.as_str(),
+                number = %info.number,
+                state = call_state::state_name(info.state),
+                "an outgoing call from an earlier run is still up; ending it"
+            );
+            let _ = modem.hangup(&path).await;
             return Ok(());
         }
         if self.call.is_some() {
