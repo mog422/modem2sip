@@ -250,8 +250,17 @@ impl Default for Upstream {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Rtp {
-    /// Address RTP sockets bind to.  Defaults to the SIP bind address.
+    /// Address RTP sockets bind to.  Defaults to the address SIP is reachable
+    /// on, which is what a single-homed host wants.  Set it to pin the media
+    /// to one interface, or to `0.0.0.0` to listen on all of them.
     pub bind: Option<String>,
+    /// Address the SDP advertises for RTP.
+    ///
+    /// Defaults to `bind` when that names a specific address - if the media
+    /// only listens there, that is where the peer has to send.  Set this as
+    /// well when the peer reaches us at a different address than the one the
+    /// socket is bound to, i.e. behind NAT.
+    pub public_ip: Option<String>,
     pub port_min: u16,
     pub port_max: u16,
     /// Target jitter buffer depth in milliseconds.
@@ -298,6 +307,7 @@ impl Default for Rtp {
     fn default() -> Self {
         Self {
             bind: None,
+            public_ip: None,
             port_min: 16384,
             port_max: 16584,
             jitter_ms: 60,
@@ -454,6 +464,17 @@ impl Config {
                 anyhow::ensure!(!token.is_empty(), "http.token must not be empty");
             }
         }
+        // Parsed here rather than where they are used: a typo used to be
+        // swallowed by an `ok()` and the media quietly went out of whichever
+        // address SIP happened to be on.
+        for (what, value) in
+            [("rtp.bind", &self.rtp.bind), ("rtp.public_ip", &self.rtp.public_ip)]
+        {
+            if let Some(v) = value {
+                v.parse::<IpAddr>()
+                    .with_context(|| format!("{what} is not an IP address: {v}"))?;
+            }
+        }
         anyhow::ensure!(self.rtp.port_min < self.rtp.port_max, "rtp.port_min must be < rtp.port_max");
         anyhow::ensure!(self.rtp.port_min >= 1024, "rtp.port_min must be >= 1024");
         anyhow::ensure!(
@@ -498,5 +519,55 @@ impl Config {
         self.sip.bind.parse().unwrap_or_else(|_| {
             std::net::SocketAddr::from(([0, 0, 0, 0], 5060))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(toml: &str) -> Result<Config> {
+        let cfg: Config = toml::from_str(toml)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// A mistyped address used to be swallowed by an `ok()`, and the media
+    /// quietly went out of whichever address SIP happened to be on.
+    #[test]
+    fn a_bad_rtp_address_is_refused_at_startup() {
+        assert!(load("[rtp]\nbind = \"192.168.1.5\"\n").is_ok());
+        assert!(load("[rtp]\nbind = \"0.0.0.0\"\n").is_ok());
+        assert!(load("[rtp]\npublic_ip = \"203.0.113.7\"\n").is_ok());
+        assert!(load("").is_ok());
+
+        for bad in ["\"0.0.0.0:16384\"", "\"eth0\"", "\"192.168.1.999\"", "\"\""] {
+            let err = load(&format!("[rtp]\nbind = {bad}\n")).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("rtp.bind is not an IP address"),
+                "wrong error for {bad}: {err:#}"
+            );
+        }
+        assert!(load("[rtp]\npublic_ip = \"nope\"\n").is_err());
+    }
+
+    /// The bounds exist so the ALSA frame arithmetic stays inside a 32-bit
+    /// C long; the shipped defaults have to sit inside them.
+    #[test]
+    fn the_defaults_pass_validation() {
+        let cfg = load("").unwrap();
+        assert_eq!(cfg.audio.rate, 8000);
+        assert!(load("[audio]\nrate = 4000\n").is_err());
+        assert!(load("[audio]\nperiod_ms = 0\n").is_err());
+        assert!(load("[audio]\nperiods = 1\n").is_err());
+        assert!(load("[audio]\ntx_gain = -1.0\n").is_err());
+    }
+    /// The file we tell people to copy has to actually load.
+    #[test]
+    fn the_shipped_example_is_valid() {
+        let text = include_str!("../config.example.toml");
+        let cfg = load(text).expect("config.example.toml must pass validation");
+        assert_eq!(cfg.audio.rate, 8000);
+        assert!(cfg.rtp.port_min < cfg.rtp.port_max);
     }
 }

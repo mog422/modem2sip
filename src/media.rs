@@ -96,12 +96,20 @@ impl MediaSession {
         let mut port = first + 2 * (rand::thread_rng().gen_range(0..slots) as u16);
 
         for _ in 0..slots {
-            if let Ok(sock) = UdpSocket::bind(SocketAddr::new(ip, port)).await {
-                return Ok((sock, port));
+            match UdpSocket::bind(SocketAddr::new(ip, port)).await {
+                Ok(sock) => return Ok((sock, port)),
+                // An address that is not on this host fails the same way on
+                // every port in the range.  Walking all of them to report "no
+                // free port" would send the operator hunting for a conflict
+                // that is not there, so anything but a busy port stops here.
+                Err(e) if e.kind() != std::io::ErrorKind::AddrInUse => {
+                    return Err(anyhow!("cannot bind RTP to {ip}: {e}"));
+                }
+                Err(_) => {}
             }
             port = if port >= last { first } else { port + 2 };
         }
-        Err(anyhow!("no free RTP port in {min}..{max}"))
+        Err(anyhow!("every RTP port in {min}..{max} on {ip} is already in use"))
     }
 
     pub fn start(

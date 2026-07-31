@@ -299,7 +299,7 @@ impl Gateway {
         )
         .await?;
 
-        let advertised = self.core.transport.advertised_ip(target_addr);
+        let advertised = self.rtp_advertised_ip(target_addr);
         let sdp = Sdp::offer(
             advertised,
             port,
@@ -507,8 +507,10 @@ impl Gateway {
         let dtmf_pt = self.shared.cfg.rtp.dtmf_payload_type;
         let ptime = self.shared.cfg.audio.period_ms;
         let core = self.core.clone();
+        let advertised = self.rtp_advertised_ip(
+            self.call.as_ref().map(|c| c.remote_addr).ok_or_else(|| anyhow!("call vanished"))?,
+        );
         let call = self.call.as_ref().ok_or_else(|| anyhow!("call vanished"))?;
-        let advertised = core.transport.advertised_ip(call.remote_addr);
         let answer = remote_sdp.answer(advertised, call.local_rtp_port, codec, Some(dtmf_pt), ptime);
         let src = call.invite_src.unwrap_or(call.remote_addr);
         let mut resp = core.make_response(&call.invite, code, None);
@@ -729,7 +731,7 @@ impl Gateway {
             // receive those digits, so the answer stays quiet about it rather
             // than promising a payload type nothing is listening for.
             let dtmf_pt = call.media_dtmf_pt.filter(|pt| sdp.telephone_event == Some(*pt));
-            let advertised = self.core.transport.advertised_ip(src);
+            let advertised = self.rtp_advertised_ip(src);
             let answer = sdp.answer(
                 advertised,
                 call.local_rtp_port,
@@ -1267,14 +1269,8 @@ impl Gateway {
     // ------------------------------------------------------------------ media
 
     fn rtp_bind_ip(&self, peer: SocketAddr) -> std::net::IpAddr {
-        if let Some(cfg_ip) = self
-            .shared
-            .cfg
-            .rtp
-            .bind
-            .as_deref()
-            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-        {
+        // Validated at start-up, so a value here always parses.
+        if let Some(cfg_ip) = parse_ip(self.shared.cfg.rtp.bind.as_deref()) {
             return cfg_ip;
         }
         let bound = self.core.transport.bound().ip();
@@ -1284,6 +1280,10 @@ impl Gateway {
         } else {
             bound
         }
+    }
+
+    fn rtp_advertised_ip(&self, peer: SocketAddr) -> std::net::IpAddr {
+        media_address(&self.shared.cfg.rtp, self.core.transport.advertised_ip(peer))
     }
 
     /// The ALSA threads give up on a card that keeps failing (a modem that is
@@ -1842,6 +1842,28 @@ async fn invite_response_task(
     }
 }
 
+/// The address to put in the SDP for our own media.
+///
+/// Not necessarily the one SIP is reachable on: pinning RTP to an interface
+/// is pointless if the peer is still told to send it to wherever the
+/// signalling happened to arrive.
+fn media_address(cfg: &crate::config::Rtp, sip_advertised: std::net::IpAddr) -> std::net::IpAddr {
+    if let Some(ip) = parse_ip(cfg.public_ip.as_deref()) {
+        return ip;
+    }
+    match parse_ip(cfg.bind.as_deref()) {
+        // A wildcard bind says nothing about where to reach us.
+        Some(ip) if !ip.is_unspecified() => ip,
+        _ => sip_advertised,
+    }
+}
+
+/// Addresses in the config are validated at start-up, so anything that
+/// reaches here parses.
+fn parse_ip(value: Option<&str>) -> Option<std::net::IpAddr> {
+    value.and_then(|s| s.parse().ok())
+}
+
 /// Does `req` belong to `call`'s dialog?
 ///
 /// The Call-ID alone is not enough: it travels in the clear on every packet
@@ -2109,5 +2131,31 @@ mod tests {
         call.remote = NameAddr::parse("<sip:alice@h>").unwrap();
         assert!(in_dialog_of(&call, &bye("<sip:gw@h>;tag=ours", "<sip:a@h>;tag=x", "call-1")));
         assert!(!in_dialog_of(&call, &bye("<sip:gw@h>;tag=no", "<sip:a@h>;tag=x", "call-1")));
+    }
+    /// Pinning the media to an interface is pointless if the peer is still
+    /// told to send it wherever the signalling arrived.
+    #[test]
+    fn the_sdp_follows_the_rtp_bind_address() {
+        let sip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let rtp = |bind: Option<&str>, public: Option<&str>| {
+            let cfg = crate::config::Rtp {
+                bind: bind.map(str::to_string),
+                public_ip: public.map(str::to_string),
+                ..Default::default()
+            };
+            media_address(&cfg, sip).to_string()
+        };
+
+        // Nothing configured: whatever SIP advertises.
+        assert_eq!(rtp(None, None), "10.0.0.1");
+        // A specific bind is where the peer has to send.
+        assert_eq!(rtp(Some("192.168.9.5"), None), "192.168.9.5");
+        // A wildcard says nothing about where to reach us.
+        assert_eq!(rtp(Some("0.0.0.0"), None), "10.0.0.1");
+        assert_eq!(rtp(Some("::"), None), "10.0.0.1");
+        // An explicit public address wins over both.
+        assert_eq!(rtp(Some("192.168.9.5"), Some("203.0.113.7")), "203.0.113.7");
+        assert_eq!(rtp(None, Some("203.0.113.7")), "203.0.113.7");
+        assert_eq!(rtp(Some("0.0.0.0"), Some("203.0.113.7")), "203.0.113.7");
     }
 }

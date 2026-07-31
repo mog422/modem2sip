@@ -347,6 +347,21 @@ whole sequence whenever the device returns. Meanwhile:
 * `REGISTER` keeps working, so UAs stay bound and get calls as soon as the
   modem is back
 
+### Where the media goes
+
+`rtp.bind` picks the address the media sockets live on. Left unset it follows
+SIP, which is what a single-homed host wants; set it when the audio has to
+leave by a different route than the signalling, or to `0.0.0.0` to listen
+everywhere.
+
+A specific `rtp.bind` is also what the SDP advertises, because that is the
+only address the peer can reach the media on. `rtp.public_ip` overrides just
+the advertised half, for the case where the socket is bound to a private
+address and the peer sees a different one. Both are checked at start-up, so a
+typo stops the process instead of silently sending the audio somewhere else.
+
+`sip.public_ip` still governs Via and Contact.
+
 ## Running several modems
 
 One process per modem, each with its own config: different `[modem]` matcher,

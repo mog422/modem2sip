@@ -88,7 +88,15 @@ retry_after_secs = 30
 # contact_user = "modem1"
 
 [rtp]
-# bind    = "0.0.0.0"               # defaults to the SIP bind address
+# Where the media sockets live.  The default is the address SIP is reachable
+# on, which is what a single-homed host wants.  Pin it to one interface when
+# the media has to leave by a different route than the signalling, or set
+# "0.0.0.0" to listen on all of them.
+# bind      = "192.168.1.5"
+# The address put in the SDP.  Defaults to `bind` when that names a specific
+# address - if the media only listens there, that is where the peer has to
+# send.  Set it as well only when the peer reaches us somewhere else (NAT).
+# public_ip = "203.0.113.7"
 port_min  = 16384
 port_max  = 16584
 jitter_ms = 60
