@@ -152,11 +152,6 @@ impl Headers {
         }
     }
 
-    /// Insert at the front - used for Via, which must stay topmost.
-    pub fn push_front(&mut self, name: &str, value: impl Into<String>) {
-        self.0.insert(0, (canonical(name), value.into()));
-    }
-
     pub fn remove(&mut self, name: &str) {
         let n = canonical(name);
         self.0.retain(|(k, _)| *k != n);
@@ -286,13 +281,6 @@ pub enum Message {
 }
 
 impl Message {
-    pub fn headers(&self) -> &Headers {
-        match self {
-            Message::Request(r) => &r.headers,
-            Message::Response(r) => &r.headers,
-        }
-    }
-
     pub fn parse(buf: &[u8]) -> Option<Message> {
         let split = find_body_start(buf)?;
         let head = std::str::from_utf8(&buf[..split.0]).ok()?;

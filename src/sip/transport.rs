@@ -25,9 +25,6 @@ impl Transport {
         Ok(Self { sock: Arc::new(sock), bound, public_ip })
     }
 
-    pub fn socket(&self) -> Arc<UdpSocket> {
-        self.sock.clone()
-    }
 
     pub fn bound(&self) -> SocketAddr {
         self.bound

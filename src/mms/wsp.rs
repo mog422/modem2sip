@@ -425,10 +425,6 @@ pub fn write_encoded_string(out: &mut Vec<u8>, text: &str) {
 /// IANA MIBenum for UTF-8.
 pub const CHARSET_UTF8: u64 = 106;
 
-pub fn write_short_int(out: &mut Vec<u8>, value: u8) {
-    out.push(0x80 | (value & 0x7F));
-}
-
 /// Integer-value: the canonical form is a short integer whenever the value
 /// fits in seven bits.  Carrier MMSCs do reject the long form for values
 /// like the UTF-8 charset (106), which every real PDU writes as 0xEA.

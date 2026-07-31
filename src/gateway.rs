@@ -1122,7 +1122,6 @@ impl Gateway {
         let (inband_tx, mut inband_rx) = mpsc::channel::<char>(16);
         let media = MediaSession::start(
             sock,
-            call.local_rtp_port,
             remote,
             audio,
             MediaConfig {
@@ -1171,7 +1170,6 @@ impl Gateway {
     async fn teardown_call(&mut self, reason: &str, code: u16) {
         struct Snapshot {
             role: Role,
-            answered: bool,
             invite: Request,
             invite_dest: SocketAddr,
             local_header: String,
@@ -1182,7 +1180,6 @@ impl Gateway {
 
         let Some(snap) = self.call.as_ref().map(|c| Snapshot {
             role: c.role,
-            answered: c.answered,
             invite: c.invite.clone(),
             invite_dest: c.invite_src.unwrap_or(c.remote_addr),
             local_header: c.local.to_string(),

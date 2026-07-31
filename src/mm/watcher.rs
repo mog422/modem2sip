@@ -445,7 +445,7 @@ async fn supervise(
                 let Some(sig) = sig else { break "ObjectManager stream closed".to_string() };
                 let Ok(args) = sig.args() else { continue };
                 if args.object_path().as_str() == handle.path.as_str()
-                    && args.interfaces().iter().any(|i| *i == MODEM_IFACE)
+                    && args.interfaces().contains(&MODEM_IFACE)
                 {
                     break "modem removed from ModemManager".to_string();
                 }

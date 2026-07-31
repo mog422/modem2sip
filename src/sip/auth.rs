@@ -19,29 +19,25 @@ pub fn random_hex(bytes: usize) -> String {
 
 #[derive(Debug, Clone, Default)]
 pub struct Challenge {
-    pub scheme: String,
     pub realm: String,
     pub nonce: String,
     pub opaque: Option<String>,
     pub qop: Option<String>,
     pub algorithm: Option<String>,
-    pub stale: bool,
 }
 
 impl Challenge {
     /// Parse a WWW-Authenticate / Proxy-Authenticate header value.
     pub fn parse(value: &str) -> Option<Challenge> {
         let value = value.trim();
-        let (scheme, rest) = value.split_once(char::is_whitespace)?;
+        let (_scheme, rest) = value.split_once(char::is_whitespace)?;
         let params = parse_params(rest);
         Some(Challenge {
-            scheme: scheme.to_string(),
             realm: params.get("realm").cloned().unwrap_or_default(),
             nonce: params.get("nonce").cloned().unwrap_or_default(),
             opaque: params.get("opaque").cloned(),
             qop: params.get("qop").cloned(),
             algorithm: params.get("algorithm").cloned(),
-            stale: params.get("stale").map(|s| s.eq_ignore_ascii_case("true")).unwrap_or(false),
         })
     }
 }

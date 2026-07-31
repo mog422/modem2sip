@@ -50,23 +50,6 @@ pub struct NewMessage {
     pub raw: Option<Vec<u8>>,
 }
 
-impl NewMessage {
-    pub fn sms_in(peer: impl Into<String>, text: impl Into<String>) -> Self {
-        Self {
-            kind: "sms",
-            direction: Direction::Incoming,
-            peer: peer.into(),
-            own_number: None,
-            subject: None,
-            text: Some(text.into()),
-            timestamp: None,
-            status: "received".into(),
-            external_id: None,
-            raw: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct Attachment {
     pub index: i64,
@@ -177,10 +160,6 @@ impl Db {
             conn: Arc::new(Mutex::new(conn)),
             attachments_dir: attachments_dir.to_path_buf(),
         })
-    }
-
-    pub fn attachments_dir(&self) -> &Path {
-        &self.attachments_dir
     }
 
     async fn with_conn<T, F>(&self, f: F) -> Result<T>

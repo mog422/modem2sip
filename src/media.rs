@@ -22,7 +22,6 @@ use crate::audio::{AudioRings, AudioStream, RTP_RATE};
 use crate::sip::sdp::Codec;
 
 pub struct MediaSession {
-    pub local_port: u16,
     pub remote: Arc<Mutex<SocketAddr>>,
     rings: Arc<AudioRings>,
     stop: Arc<AtomicBool>,
@@ -67,7 +66,6 @@ impl MediaSession {
 
     pub fn start(
         sock: UdpSocket,
-        local_port: u16,
         remote: SocketAddr,
         audio: AudioStream,
         cfg: MediaConfig,
@@ -90,30 +88,31 @@ impl MediaSession {
             rings.push_from_network(&vec![0i16; prefill]);
         }
 
-        let mut tasks = Vec::new();
-        tasks.push(tokio::spawn(sender_loop(
-            sock.clone(),
-            remote.clone(),
-            rings.clone(),
-            stop.clone(),
-            law,
-            payload_type,
-            cfg.ptime_ms,
-            cfg.detect_inband_dtmf.then_some(inband_dtmf_tx),
-        )));
-        tasks.push(tokio::spawn(receiver_loop(
-            sock,
-            remote.clone(),
-            rings,
-            stop.clone(),
-            law,
-            payload_type,
-            cfg.dtmf_payload_type,
-            cfg.symmetric,
-            dtmf_tx,
-        )));
+        let tasks = vec![
+            tokio::spawn(sender_loop(
+                sock.clone(),
+                remote.clone(),
+                rings.clone(),
+                stop.clone(),
+                law,
+                payload_type,
+                cfg.ptime_ms,
+                cfg.detect_inband_dtmf.then_some(inband_dtmf_tx),
+            )),
+            tokio::spawn(receiver_loop(
+                sock,
+                remote.clone(),
+                rings,
+                stop.clone(),
+                law,
+                payload_type,
+                cfg.dtmf_payload_type,
+                cfg.symmetric,
+                dtmf_tx,
+            )),
+        ];
 
-        Self { local_port, remote, rings: audio.rings.clone(), stop, tasks, audio: Some(audio) }
+        Self { remote, rings: audio.rings.clone(), stop, tasks, audio: Some(audio) }
     }
 
     /// Play DTMF digits into the uplink audio.  Used when the modem cannot

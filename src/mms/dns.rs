@@ -22,7 +22,9 @@ const TYPE_AAAA: u16 = 28;
 pub struct Resolver {
     /// Carrier resolvers, tried in order.
     pub servers: Vec<IpAddr>,
-    /// Interface to bind the query socket to (SO_BINDTODEVICE).
+    /// Interface to bind the query socket to (SO_BINDTODEVICE).  Read only on
+    /// Linux, which is the only place the option exists.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub interface: Option<String>,
     /// Source address of the query socket - the bearer's address, which is
     /// what the policy routing rules match on.
@@ -294,11 +296,8 @@ fn parse_answer(msg: &[u8], want_id: u16, qtype: u16) -> Result<Answer> {
                 octets.copy_from_slice(rdata);
                 answer.addrs.push(IpAddr::V6(Ipv6Addr::from(octets)));
             }
-            TYPE_CNAME => {
-                if answer.cname.is_none() {
-                    answer.cname = read_name(msg, pos).ok();
-                }
-            }
+            // Only the first CNAME matters; the chase follows one hop.
+            TYPE_CNAME if answer.cname.is_none() => answer.cname = read_name(msg, pos).ok(),
             _ => {}
         }
         pos += rdlen;

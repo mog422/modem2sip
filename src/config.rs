@@ -254,8 +254,8 @@ pub struct Rtp {
     pub symmetric: bool,
     /// How digits received from SIP reach the far end.
     ///
-    /// * `auto`    - ask ModemManager first, fall back to in-band tones when
-    ///               it fails (VoLTE calls usually need the fallback)
+    /// * `auto`   - ask ModemManager first, fall back to in-band tones when
+    ///   it fails (VoLTE calls usually need the fallback)
     /// * `modem`   - `Call.SendDtmf` only
     /// * `inband`  - generate the tones in the uplink audio only
     /// * `none`    - drop them

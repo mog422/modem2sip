@@ -6,6 +6,11 @@ use anyhow::{anyhow, Result};
 use super::wsp::{self, Reader};
 
 /// Header field codes, already carrying the 0x80 "well-known" bit.
+///
+/// The full table from the OMA encapsulation spec, not just the fields the
+/// decoder reads today - a partial copy is the thing that goes wrong when a
+/// carrier turns out to send one of the others.
+#[allow(dead_code)]
 pub mod field {
     pub const BCC: u8 = 0x81;
     pub const CC: u8 = 0x82;
@@ -35,6 +40,7 @@ pub mod field {
     pub const RETRIEVE_TEXT: u8 = 0x9A;
 }
 
+#[allow(dead_code)]
 pub mod msg_type {
     pub const SEND_REQ: u8 = 0x80;
     pub const SEND_CONF: u8 = 0x81;
@@ -144,14 +150,6 @@ impl MmsMessage {
         } else {
             Some(texts.join("\n"))
         }
-    }
-
-    pub fn attachments(&self) -> Vec<&MmsPart> {
-        self.parts
-            .iter()
-            .filter(|p| !(p.is_text() && !p.content_type.contains("smil")))
-            .filter(|p| !p.content_type.contains("smil"))
-            .collect()
     }
 
     /// Sender without the `/TYPE=PLMN` suffix MMS addresses carry.

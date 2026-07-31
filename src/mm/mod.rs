@@ -24,11 +24,9 @@ use proxies::{
 pub struct ModemInfo {
     pub path: String,
     pub device: String,
-    pub device_id: String,
     pub equipment_id: String,
     pub manufacturer: String,
     pub model: String,
-    pub revision: String,
     pub primary_port: String,
     /// Ports ModemManager classified as AT (MM_MODEM_PORT_TYPE_AT).
     pub at_ports: Vec<String>,
@@ -71,25 +69,20 @@ pub struct BearerNet {
 
 #[derive(Debug, Clone)]
 pub struct CallInfo {
-    pub path: String,
     pub number: String,
     pub direction: i32,
     pub state: i32,
     pub audio_port: Option<String>,
-    pub audio_format: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct SmsInfo {
-    pub path: String,
     pub state: u32,
     pub pdu_type: u32,
     pub number: String,
     pub text: String,
     pub data: Vec<u8>,
     pub timestamp: Option<String>,
-    pub smsc: Option<String>,
-    pub class: i32,
 }
 
 impl SmsInfo {
@@ -126,19 +119,8 @@ impl ModemHandle {
         Ok(Arc::new(Self { conn, path, modem, voice, messaging, info, alsa }))
     }
 
-    pub async fn state(&self) -> Result<i32> {
-        Ok(self.modem.state().await?)
-    }
-
     pub async fn signal_quality(&self) -> Option<u32> {
         self.modem.signal_quality().await.ok().map(|(q, _)| q)
-    }
-
-    /// Usable for calls/messages?  Anything from "enabled" upwards is fine;
-    /// registration is checked separately because some networks report
-    /// `enabled` while attached.
-    pub async fn is_usable(&self) -> bool {
-        matches!(self.state().await, Ok(s) if s >= modem_state::MODEM_ENABLED)
     }
 
     pub async fn call_proxy(&self, path: &OwnedObjectPath) -> Result<CallProxy<'static>> {
@@ -152,18 +134,11 @@ impl ModemHandle {
     pub async fn call_info(&self, path: &OwnedObjectPath) -> Result<CallInfo> {
         let call = self.call_proxy(path).await?;
         let audio_port = call.audio_port().await.ok().filter(|s| !s.is_empty());
-        let audio_format = call
-            .audio_format()
-            .await
-            .map(|m| m.into_iter().map(|(k, v)| (k, format!("{v:?}"))).collect())
-            .unwrap_or_default();
         Ok(CallInfo {
-            path: path.to_string(),
             number: call.number().await.unwrap_or_default(),
             direction: call.direction().await.unwrap_or(call_state::DIR_UNKNOWN),
             state: call.state().await.unwrap_or(call_state::UNKNOWN),
             audio_port,
-            audio_format,
         })
     }
 
@@ -206,15 +181,12 @@ impl ModemHandle {
     pub async fn sms_info(&self, path: &OwnedObjectPath) -> Result<SmsInfo> {
         let sms = self.sms_proxy(path).await?;
         Ok(SmsInfo {
-            path: path.to_string(),
             state: sms.state().await.unwrap_or(sms_state::STATE_UNKNOWN),
             pdu_type: sms.pdu_type().await.unwrap_or(sms_state::PDU_UNKNOWN),
             number: sms.number().await.unwrap_or_default(),
             text: sms.text().await.unwrap_or_default(),
             data: sms.data().await.unwrap_or_default(),
             timestamp: sms.timestamp().await.ok().filter(|s| !s.is_empty()),
-            smsc: sms.smsc().await.ok().filter(|s| !s.is_empty()),
-            class: sms.class().await.unwrap_or(-1),
         })
     }
 
@@ -303,11 +275,9 @@ async fn read_info(
     let mut info = ModemInfo {
         path: path.to_string(),
         device: modem.device().await.unwrap_or_default(),
-        device_id: modem.device_identifier().await.unwrap_or_default(),
         equipment_id: modem.equipment_identifier().await.unwrap_or_default(),
         manufacturer: modem.manufacturer().await.unwrap_or_default(),
         model: modem.model().await.unwrap_or_default(),
-        revision: modem.revision().await.unwrap_or_default(),
         primary_port: modem.primary_port().await.unwrap_or_default(),
         own_number: modem.own_numbers().await.ok().and_then(|v| v.into_iter().next()),
         ..Default::default()

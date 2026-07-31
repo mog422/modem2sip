@@ -97,10 +97,6 @@ impl AudioRings {
         out
     }
 
-    pub fn available_for_network(&self) -> usize {
-        self.to_network.lock().unwrap().len()
-    }
-
     fn push_from_card(&self, samples: &[i16]) {
         let mut ring = self.to_network.lock().unwrap();
         ring.extend(samples.iter().copied());
@@ -160,11 +156,6 @@ impl AudioRings {
         out
     }
 
-    pub fn clear(&self) {
-        self.to_network.lock().unwrap().clear();
-        self.to_modem.lock().unwrap().clear();
-        self.tone.lock().unwrap().clear();
-    }
 }
 
 pub struct AudioStream {

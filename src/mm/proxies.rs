@@ -15,6 +15,11 @@ pub const MM_PATH: &str = "/org/freedesktop/ModemManager1";
 
 // ---------------------------------------------------------------- constants
 
+// The numbering below is ModemManager's own, transcribed whole rather
+// than trimmed to what is used today: a half-copied enum is worse than
+// no copy when the next state has to be handled.
+
+#[allow(dead_code)]
 pub mod state {
     pub const MODEM_FAILED: i32 = -1;
     pub const MODEM_UNKNOWN: i32 = 0;
@@ -50,6 +55,7 @@ pub mod state {
     }
 }
 
+#[allow(dead_code)]
 pub mod call {
     pub const UNKNOWN: i32 = 0;
     pub const DIALING: i32 = 1;
@@ -90,6 +96,7 @@ pub mod call {
     pub const REASON_DEFLECTED: u32 = 9;
 }
 
+#[allow(dead_code)]
 pub mod sms {
     pub const STATE_UNKNOWN: u32 = 0;
     pub const STATE_STORED: u32 = 1;

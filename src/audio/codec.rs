@@ -245,34 +245,6 @@ pub fn detect_dtmf(samples: &[i16], rate: u32) -> Option<char> {
     Some(DTMF_KEYS[li][hi])
 }
 
-/// Scan a PCM buffer and return the digit sequence it contains.
-pub fn scan_dtmf(samples: &[i16], rate: u32) -> String {
-    let window = (rate as usize) / 40; // 25 ms
-    let mut out = String::new();
-    let mut last: Option<char> = None;
-    let mut miss = 0;
-    for chunk in samples.chunks(window) {
-        match detect_dtmf(chunk, rate) {
-            Some(d) => {
-                if last != Some(d) {
-                    out.push(d);
-                }
-                last = Some(d);
-                miss = 0;
-            }
-            None => {
-                miss += 1;
-                // Two silent windows end the digit, so a repeated key is not
-                // merged with the previous one.
-                if miss >= 2 {
-                    last = None;
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Integer-ratio linear resampler good enough for narrow-band voice.
 /// (8k <-> 16k, occasionally 8k <-> 48k on modems with a UAC2 card.)
 #[derive(Debug, Clone)]
@@ -286,10 +258,6 @@ pub struct Resampler {
 impl Resampler {
     pub fn new(from: u32, to: u32) -> Self {
         Self { from, to, last: 0, pos: 0.0 }
-    }
-
-    pub fn is_identity(&self) -> bool {
-        self.from == self.to
     }
 
     pub fn process(&mut self, input: &[i16], out: &mut Vec<i16>) {
@@ -319,6 +287,35 @@ impl Resampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Walk a buffer and return the digits in it.  Only the tests need this;
+    /// the live path detects one digit at a time, per RTP packet.
+    fn scan_dtmf(samples: &[i16], rate: u32) -> String {
+        let window = (rate as usize) / 40; // 25 ms
+        let mut out = String::new();
+        let mut last: Option<char> = None;
+        let mut miss = 0;
+        for chunk in samples.chunks(window) {
+            match detect_dtmf(chunk, rate) {
+                Some(d) => {
+                    if last != Some(d) {
+                        out.push(d);
+                    }
+                    last = Some(d);
+                    miss = 0;
+                }
+                None => {
+                    miss += 1;
+                    // Two silent windows end the digit, so a repeated key is
+                    // not merged with the previous one.
+                    if miss >= 2 {
+                        last = None;
+                    }
+                }
+            }
+        }
+        out
+    }
 
     #[test]
     fn ulaw_round_trip_is_close() {

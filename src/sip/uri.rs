@@ -88,27 +88,9 @@ impl Uri {
         Some(Uri { scheme, user, password, host, port, params, headers: hdrs })
     }
 
-    pub fn param(&self, name: &str) -> Option<&str> {
-        self.params
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .and_then(|(_, v)| v.as_deref())
-    }
-
-    pub fn has_param(&self, name: &str) -> bool {
-        self.params.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
-    }
-
     pub fn set_param(&mut self, name: &str, value: Option<&str>) {
         self.params.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
         self.params.push((name.to_string(), value.map(|v| v.to_string())));
-    }
-
-    pub fn host_port(&self) -> String {
-        match self.port {
-            Some(p) => format!("{}:{}", self.host, p),
-            None => self.host.clone(),
-        }
     }
 
     /// URI without parameters/headers - used for dialog target comparison.
@@ -122,11 +104,6 @@ impl Uri {
             params: Vec::new(),
             headers: Vec::new(),
         }
-    }
-
-    /// Transport parameter, defaulting to UDP.
-    pub fn transport(&self) -> String {
-        self.param("transport").unwrap_or("udp").to_ascii_lowercase()
     }
 }
 
@@ -285,7 +262,8 @@ mod tests {
         assert_eq!(u.user.as_deref(), Some("+821012345678"));
         assert_eq!(u.host, "example.com");
         assert_eq!(u.port, Some(5062));
-        assert_eq!(u.param("transport"), Some("udp"));
+        assert_eq!(u.params, vec![("transport".into(), Some("udp".into())),
+                                  ("user".into(), Some("phone".into()))]);
     }
 
     #[test]
@@ -307,7 +285,7 @@ mod tests {
         assert_eq!(u.scheme, "tel");
         let u = Uri::parse("tel:0212345678;phone-context=+82").unwrap();
         assert_eq!(u.user.as_deref(), Some("0212345678"));
-        assert_eq!(u.param("phone-context"), Some("+82"));
+        assert_eq!(u.params, vec![("phone-context".into(), Some("+82".into()))]);
 
         // It has to survive being written back out: the digest `uri` check
         // and the dialog headers both compare re-serialised URIs.

@@ -20,7 +20,6 @@ pub fn is_wap_push(data: &[u8]) -> bool {
 }
 
 pub struct WapPush {
-    pub transaction_id: u8,
     pub content_type: String,
     pub body: Vec<u8>,
 }
@@ -30,7 +29,7 @@ pub fn parse_wap_push(data: &[u8]) -> Result<WapPush> {
         bail!("not a WSP push PDU");
     }
     let mut r = wsp::Reader::new(data);
-    let transaction_id = r.u8().ok_or_else(|| anyhow!("truncated push PDU"))?;
+    r.u8().ok_or_else(|| anyhow!("truncated push PDU"))?;
     let _pdu_type = r.u8();
     let headers_len = r.uintvar().ok_or_else(|| anyhow!("bad push headers length"))? as usize;
     let headers_start = r.pos;
@@ -44,7 +43,7 @@ pub fn parse_wap_push(data: &[u8]) -> Result<WapPush> {
         .content_type()
         .ok_or_else(|| anyhow!("push PDU without a content type"))?;
 
-    Ok(WapPush { transaction_id, content_type, body: data[headers_end..].to_vec() })
+    Ok(WapPush { content_type, body: data[headers_end..].to_vec() })
 }
 
 /// True when the push carries an MMS PDU.

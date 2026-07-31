@@ -198,7 +198,7 @@ impl Sdp {
         }
     }
 
-    pub fn to_string(&self) -> String {
+    fn render(&self) -> String {
         let ipver = if self.address.is_ipv6() { "IP6" } else { "IP4" };
         let mut s = String::new();
         s.push_str("v=0\r\n");
@@ -230,6 +230,12 @@ impl Sdp {
         }
         s.push_str(&format!("a={}\r\n", self.sendrecv.as_str()));
         s
+    }
+}
+
+impl std::fmt::Display for Sdp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.render())
     }
 }
 

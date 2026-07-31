@@ -453,13 +453,7 @@ impl SipCore {
                     .and_then(|v| v.trim().parse::<u32>().ok())
                     .unwrap_or(default_expires)
                     .min(MAX_REGISTER_EXPIRES);
-                self.registrar.update(
-                    &aor,
-                    contact,
-                    src,
-                    expires,
-                    req.headers.call_id().unwrap_or_default(),
-                );
+                self.registrar.update(&aor, contact, src, expires);
             }
         }
 

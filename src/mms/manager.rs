@@ -244,8 +244,11 @@ impl MmsManager {
             // to no parts at all, and that is what has to be caught.
             if message.parts.is_empty() {
                 bail!(
-                    "the MMSC returned a {} with no content instead of an M-Retrieve.conf",
-                    pdu::msg_type::name(message.message_type)
+                    "the MMSC returned a {} with no content ({}, {} bytes) instead of an \
+                     M-Retrieve.conf",
+                    pdu::msg_type::name(message.message_type),
+                    resp.content_type().unwrap_or("no content type"),
+                    resp.body.len()
                 );
             }
             warn!(
