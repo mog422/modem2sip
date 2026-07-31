@@ -130,9 +130,13 @@ pub fn charset_for(mib: u32) -> &'static encoding_rs::Encoding {
         1014 => encoding_rs::UTF_16LE,
         36 | 38 => encoding_rs::EUC_KR, // ks_c_5601-1987 / euc-kr
         17 | 2024 => encoding_rs::SHIFT_JIS,
-        18 | 2025 => encoding_rs::EUC_JP,
+        18 => encoding_rs::EUC_JP,
         2026 => encoding_rs::BIG5,
-        113 | 2085 => encoding_rs::GBK,
+        // 2025 is GB2312 and 2085 is HZ-GB-2312; grouping 2025 with EUC-JP
+        // turned every Chinese subject into mojibake.  GBK is a superset of
+        // GB2312, and encoding_rs has no HZ decoder, so GB18030 stands in.
+        57 | 113 | 2025 => encoding_rs::GBK,
+        2085 => encoding_rs::GB18030,
         _ => encoding_rs::UTF_8,
     }
 }

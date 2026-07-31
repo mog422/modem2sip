@@ -27,10 +27,29 @@ pub struct Challenge {
 }
 
 impl Challenge {
+    /// Can the digest be computed the way this challenge asks for?
+    ///
+    /// Only MD5 is implemented.  Echoing back an unknown algorithm with an
+    /// MD5 hash under it produces a response the peer silently rejects, and
+    /// nothing in the logs says why; refusing it names the reason.
+    pub fn is_supported(&self) -> bool {
+        self.algorithm
+            .as_deref()
+            .map(|a| a.eq_ignore_ascii_case("MD5") || a.eq_ignore_ascii_case("MD5-sess"))
+            .unwrap_or(true)
+    }
+
     /// Parse a WWW-Authenticate / Proxy-Authenticate header value.
+    ///
+    /// Only Digest: a Basic or NTLM challenge parsed as one would yield a
+    /// challenge with an empty realm and nonce, which then gets answered with
+    /// a digest of nothing rather than reported as unsupported.
     pub fn parse(value: &str) -> Option<Challenge> {
         let value = value.trim();
-        let (_scheme, rest) = value.split_once(char::is_whitespace)?;
+        let (scheme, rest) = value.split_once(char::is_whitespace)?;
+        if !scheme.eq_ignore_ascii_case("Digest") {
+            return None;
+        }
         let params = parse_params(rest);
         Some(Challenge {
             realm: params.get("realm").cloned().unwrap_or_default(),

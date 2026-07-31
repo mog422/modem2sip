@@ -721,6 +721,13 @@ impl Gateway {
             resp.body = answer.to_string().into_bytes();
         }
         if let (Some(call), Some(sdp)) = (self.call.as_mut(), offer) {
+            // The stream was just renegotiated, so whatever silence built up
+            // while the peer was on hold - or moving its media - says nothing
+            // about whether it is there now.  Start the clock again, or the
+            // next watchdog tick ends a call that has only just resumed.
+            if let Some(media) = call.media.as_ref() {
+                media.reset_silence();
+            }
             call.remote_sdp = Some(sdp);
         }
         self.core.respond(&req, src, resp).await
@@ -1118,10 +1125,14 @@ impl Gateway {
         } else {
             ("proxy-authenticate", "proxy-authorization")
         };
-        let Some(challenge) =
-            resp.headers.get(hdr).and_then(crate::sip::auth::Challenge::parse)
+        let Some(challenge) = resp
+            .headers
+            .get_all(hdr)
+            .into_iter()
+            .filter_map(crate::sip::auth::Challenge::parse)
+            .find(crate::sip::auth::Challenge::is_supported)
         else {
-            warn!(code = resp.code, "challenge without a parsable {hdr} header");
+            warn!(code = resp.code, "no digest challenge in {hdr} that we can answer (MD5 only)");
             return Ok(false);
         };
 
@@ -1265,8 +1276,18 @@ impl Gateway {
             self.teardown_call("the modem audio stream died", 200).await;
             return;
         }
+        // A peer that offered a=recvonly or a=inactive has told us it will
+        // send nothing, so its silence is not evidence that it has gone away.
+        // Reading it that way would hang up a perfectly good call whenever a
+        // PBX holds it without music.
+        let peer_sends = self
+            .call
+            .as_ref()
+            .and_then(|c| c.remote_sdp.as_ref())
+            .map(|s| s.sendrecv.peer_sends())
+            .unwrap_or(true);
         let timeout = Duration::from_secs(self.shared.cfg.rtp.timeout_secs);
-        if !timeout.is_zero() && media.silence() > timeout {
+        if peer_sends && !timeout.is_zero() && media.silence() > timeout {
             // Nothing else would ever end this call: a peer that vanished
             // without a BYE cannot be asked, and the mobile leg stays up -
             // and billed - until the process is restarted.

@@ -205,6 +205,15 @@ impl MediaSession {
         self.clock.since_last_rtp()
     }
 
+    /// Treat the peer as having just been heard from.
+    ///
+    /// Called when a re-INVITE renegotiates the stream: the silence that
+    /// built up while it was on hold, or while it was moving its media, is
+    /// not evidence that the peer has gone away now that it is talking again.
+    pub fn reset_silence(&self) {
+        self.clock.stamp();
+    }
+
     pub fn audio_failed(&self) -> bool {
         self.audio.as_ref().map(|a| a.is_failed()).unwrap_or(false)
     }

@@ -129,7 +129,7 @@ impl fmt::Display for Uri {
                 write!(f, "@")?;
             }
         }
-        write!(f, "{}", self.host)?;
+        write!(f, "{}", host_for_wire(&self.host))?;
         if let Some(p) = self.port {
             write!(f, ":{p}")?;
         }
@@ -241,6 +241,19 @@ impl fmt::Display for NameAddr {
     }
 }
 
+/// Bracket an IPv6 literal for the wire (RFC 3261 §19.1.1 `IPv6reference`).
+///
+/// The struct stores the host unbracketed, because that is what a resolver
+/// wants.  Writing it out that way produced `sip:a@2001:db8::5:5060`, which
+/// nothing - including this parser - can split back into a host and a port.
+pub fn host_for_wire(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
 pub fn split_host_port(s: &str) -> (String, Option<u16>) {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix('[') {
@@ -331,6 +344,31 @@ mod tests {
             assert_eq!(u.to_string(), text);
             assert_eq!(Uri::parse(&u.to_string()).as_ref(), Some(&u));
         }
+    }
+
+    /// An IPv6 host written without its brackets cannot be split back into a
+    /// host and a port, so every Contact and Via the gateway wrote on a v6
+    /// deployment was unparseable - including by this parser.
+    #[test]
+    fn ipv6_hosts_keep_their_brackets_on_the_wire() {
+        let u = Uri::parse("sip:1000@[2001:db8::5]:5060").unwrap();
+        assert_eq!(u.host, "2001:db8::5", "the struct keeps the resolver's form");
+        assert_eq!(u.port, Some(5060));
+        assert_eq!(u.to_string(), "sip:1000@[2001:db8::5]:5060");
+
+        let back = Uri::parse(&u.to_string()).unwrap();
+        assert_eq!(back.host, "2001:db8::5");
+        assert_eq!(back.port, Some(5060));
+
+        // Without a port, and for a plain host, nothing changes.
+        assert_eq!(
+            Uri::parse("sip:a@[fd00::1]").unwrap().to_string(),
+            "sip:a@[fd00::1]"
+        );
+        assert_eq!(host_for_wire("example.com"), "example.com");
+        assert_eq!(host_for_wire("10.0.0.1"), "10.0.0.1");
+        // Already bracketed input is not bracketed twice.
+        assert_eq!(host_for_wire("[fd00::1]"), "[fd00::1]");
     }
 
     /// Replacing a parameter must not leave the old copy behind.

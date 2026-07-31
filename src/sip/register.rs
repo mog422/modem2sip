@@ -36,7 +36,12 @@ pub async fn run(core: Arc<SipCore>) {
                 // still there to keep a registrar that grants something
                 // absurdly short from turning this into a request flood.
                 let granted = expires as u64;
-                let refresh = (granted * 4 / 5).min(granted.saturating_sub(1)).clamp(5, 3600);
+                // The floor comes first and the cap last, or the floor wins
+                // over "inside the lifetime" and a short grant lapses between
+                // refreshes - the one thing the cap exists to prevent.
+                let refresh = (granted * 4 / 5)
+                    .clamp(5, 3600)
+                    .min(granted.saturating_sub(1).max(1));
                 info!(registrar = %up.registrar, expires, refresh, "registered upstream");
                 tokio::time::sleep(Duration::from_secs(refresh)).await;
             }

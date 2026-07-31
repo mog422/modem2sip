@@ -697,7 +697,12 @@ impl SipCore {
         let branch = format!("z9hG4bK{}", auth::random_hex(8));
         req.headers.push(
             "via",
-            format!("SIP/2.0/UDP {}:{};rport;branch={}", ip, self.transport.port(), branch),
+            format!(
+                "SIP/2.0/UDP {}:{};rport;branch={}",
+                super::uri::host_for_wire(&ip.to_string()),
+                self.transport.port(),
+                branch
+            ),
         );
         req.headers.set("max-forwards", "70");
         req.headers.set("from", from.to_string());
@@ -740,11 +745,20 @@ impl SipCore {
         } else {
             ("proxy-authenticate", "proxy-authorization")
         };
+        // RFC 8760: a peer may offer several challenges, strongest first, and
+        // only some of them are ones we can answer.  Taking the first one
+        // blindly meant a SHA-256 challenge was answered with an MD5 digest
+        // labelled SHA-256 - rejected every time, with nothing in the log to
+        // say why.
         let challenge = resp
             .headers
-            .get(hdr)
-            .and_then(Challenge::parse)
-            .ok_or_else(|| anyhow!("{} without a parsable challenge", resp.code))?;
+            .get_all(hdr)
+            .into_iter()
+            .filter_map(Challenge::parse)
+            .find(Challenge::is_supported)
+            .ok_or_else(|| {
+                anyhow!("{} with no digest challenge this gateway can answer (MD5 only)", resp.code)
+            })?;
 
         let uri_str = req.uri.to_string();
         let creds = auth::answer(

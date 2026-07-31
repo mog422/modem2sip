@@ -62,6 +62,23 @@ impl Direction {
             Direction::Inactive => "inactive",
         }
     }
+
+    /// The direction an answer takes to this offer (RFC 3264 §6.1).
+    ///
+    /// The two ends describe the same stream from opposite sides, so a peer
+    /// that says it will only send is told we will only receive.
+    pub fn reversed(self) -> Direction {
+        match self {
+            Direction::SendOnly => Direction::RecvOnly,
+            Direction::RecvOnly => Direction::SendOnly,
+            same => same,
+        }
+    }
+
+    /// Is the peer that offered this going to send us anything?
+    pub fn peer_sends(self) -> bool {
+        matches!(self, Direction::SendRecv | Direction::SendOnly)
+    }
 }
 
 impl Sdp {
@@ -194,7 +211,10 @@ impl Sdp {
             // receive path is keyed on the offered number.
             telephone_event: dtmf_pt.and(self.telephone_event),
             ptime: Some(ptime),
-            sendrecv: Direction::SendRecv,
+            // RFC 3264 §6.1: the answer mirrors the offer.  Answering a hold
+            // (a=sendonly) with sendrecv told the peer we were still ready to
+            // be heard, which is both a protocol error and a lie.
+            sendrecv: self.sendrecv.reversed(),
         }
     }
 
@@ -286,6 +306,44 @@ mod tests {
             offer.answer("10.0.0.1".parse().unwrap(), 16000, Codec::Pcmu, None, 20).telephone_event,
             None
         );
+    }
+
+    /// An answer mirrors the offer's direction, and a peer on hold has to be
+    /// told we stopped too - otherwise it is being promised audio it asked
+    /// not to receive.
+    #[test]
+    fn the_answer_mirrors_the_direction_of_the_offer() {
+        let offer = |attr: &str| {
+            Sdp::parse(&format!(
+                "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 40000 RTP/AVP 0\r\na={attr}\r\n"
+            ))
+            .unwrap()
+        };
+        let answer = |attr: &str| {
+            offer(attr)
+                .answer("10.0.0.1".parse().unwrap(), 16000, Codec::Pcmu, None, 20)
+                .sendrecv
+        };
+        assert_eq!(answer("sendonly"), Direction::RecvOnly, "hold must be answered recvonly");
+        assert_eq!(answer("recvonly"), Direction::SendOnly);
+        assert_eq!(answer("inactive"), Direction::Inactive);
+        assert_eq!(answer("sendrecv"), Direction::SendRecv);
+        // No attribute at all means sendrecv, and so does the answer.
+        assert_eq!(
+            Sdp::parse("v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 40000 RTP/AVP 0\r\n")
+                .unwrap()
+                .answer("10.0.0.1".parse().unwrap(), 16000, Codec::Pcmu, None, 20)
+                .sendrecv,
+            Direction::SendRecv
+        );
+        // Which offers mean "expect no RTP from me", which the inactivity
+        // watchdog has to know before it reads silence as a dead peer.
+        // `sendonly` is not one of them: a peer holding us with music still
+        // sends.  `recvonly` and `inactive` are.
+        assert!(offer("sendonly").sendrecv.peer_sends());
+        assert!(offer("sendrecv").sendrecv.peer_sends());
+        assert!(!offer("recvonly").sendrecv.peer_sends());
+        assert!(!offer("inactive").sendrecv.peer_sends());
     }
 
     /// Port 0 or a null address means "no media here"; taking it at face
