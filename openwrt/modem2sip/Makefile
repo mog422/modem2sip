@@ -45,7 +45,7 @@ define Package/modem2sip
   DEPENDS:=$(RUST_ARCH_DEPENDS) \
 	+modemmanager \
 	+alsa-lib \
-	+libsqlite3-0 \
+	+libsqlite3 \
 	+kmod-usb-audio
 endef
 
