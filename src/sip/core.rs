@@ -29,9 +29,38 @@ pub enum SipEvent {
 }
 
 struct ClientTxnEntry {
+    /// The method this transaction sent.  A CANCEL reuses the branch of the
+    /// INVITE it cancels, so the branch alone does not identify a response.
+    method: Method,
     tx: mpsc::UnboundedSender<Response>,
     stop_retransmit: Arc<AtomicBool>,
 }
+
+/// Server-side transaction state, kept so that a retransmitted request is
+/// never executed twice.
+enum ServerTxn {
+    /// Handed to a handler; the final response has not been produced yet.
+    /// The most recent provisional, if any, is kept so a retransmission can
+    /// be answered with it.
+    InProgress { since: Instant, provisional: Option<Vec<u8>> },
+    /// Answered.  Retransmissions get this response replayed verbatim.
+    Completed(Vec<u8>, Instant),
+}
+
+impl ServerTxn {
+    fn started(&self) -> Instant {
+        match self {
+            ServerTxn::InProgress { since, .. } => *since,
+            ServerTxn::Completed(_, t) => *t,
+        }
+    }
+}
+
+/// How long a server transaction is remembered (RFC 3261 Timer H / 64*T1).
+const TXN_LIFETIME: Duration = Duration::from_secs(32);
+
+/// Longest registration this registrar hands out, whatever the UA asks for.
+const MAX_REGISTER_EXPIRES: u32 = 3600;
 
 /// Handle for an outstanding client transaction.
 pub struct ClientTxn {
@@ -76,8 +105,11 @@ pub struct SipCore {
     pub registrar: Registrar,
     nonce: NonceFactory,
     client_txns: Mutex<HashMap<String, ClientTxnEntry>>,
-    /// Cached final responses for retransmission detection (branch+method).
-    server_cache: Mutex<HashMap<String, (Vec<u8>, Instant)>>,
+    /// Server transactions, keyed by branch+cseq+method.
+    server_cache: Mutex<HashMap<String, ServerTxn>>,
+    /// Highest nonce-count seen per issued nonce, so a captured Authorization
+    /// header cannot simply be replayed.
+    nonce_seen: Mutex<HashMap<String, (u32, Instant)>>,
     events: mpsc::Sender<SipEvent>,
     /// Whether the modem is usable right now; drives 503 responses.
     modem_ready: Arc<AtomicBool>,
@@ -106,6 +138,7 @@ impl SipCore {
             nonce: NonceFactory::new(),
             client_txns: Mutex::new(HashMap::new()),
             server_cache: Mutex::new(HashMap::new()),
+            nonce_seen: Mutex::new(HashMap::new()),
             events,
             modem_ready,
             cseq: AtomicU32::new(1),
@@ -166,10 +199,14 @@ impl SipCore {
     }
 
     fn gc(&self) {
+        let now = Instant::now();
         let mut cache = self.server_cache.lock().unwrap();
-        if cache.len() > 256 {
-            let cutoff = Instant::now() - Duration::from_secs(64);
-            cache.retain(|_, (_, t)| *t > cutoff);
+        if cache.len() > 64 {
+            cache.retain(|_, txn| now.duration_since(txn.started()) < TXN_LIFETIME);
+        }
+        let mut nonces = self.nonce_seen.lock().unwrap();
+        if nonces.len() > 64 {
+            nonces.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(600));
         }
     }
 
@@ -179,8 +216,21 @@ impl SipCore {
             debug!("response without Via branch, dropped");
             return;
         };
+        let Some((_, method)) = resp.headers.cseq() else {
+            debug!(%branch, "response without a usable CSeq, dropped");
+            return;
+        };
         let map = self.client_txns.lock().unwrap();
         match map.get(&branch) {
+            // A CANCEL carries the branch of the INVITE it cancels, so its
+            // 200 OK would otherwise be delivered as if the INVITE had been
+            // answered.
+            Some(entry) if entry.method != method => debug!(
+                %branch,
+                code = resp.code,
+                %method,
+                "response method does not match the transaction, dropped"
+            ),
             Some(entry) => {
                 entry.stop_retransmit.store(true, Ordering::Relaxed);
                 let _ = entry.tx.send(resp);
@@ -196,14 +246,32 @@ impl SipCore {
             return Ok(());
         }
 
-        // Retransmission of a request we already answered?
+        // Retransmission handling.  Answering a request twice is not just
+        // noise: a repeated MESSAGE sends the SMS again, and a repeated
+        // INVITE looks like a re-INVITE for a call that is still dialling.
+        // Requests are therefore claimed before any work starts, and only
+        // released once the final response has been produced.
         if req.method != Method::Ack {
             if let Some(key) = txn_key(&req) {
-                let cached = self.server_cache.lock().unwrap().get(&key).map(|(b, _)| b.clone());
-                if let Some(bytes) = cached {
-                    debug!(%key, "retransmitted request, replaying cached response");
-                    self.transport.send(&bytes, src).await?;
-                    return Ok(());
+                let claim = claim_txn(
+                    &mut self.server_cache.lock().unwrap(),
+                    &key,
+                    Instant::now(),
+                );
+                match claim {
+                    Claim::Answered(bytes) => {
+                        debug!(%key, "retransmitted request, replaying the cached response");
+                        self.transport.send(&bytes, src).await?;
+                        return Ok(());
+                    }
+                    Claim::InFlight(provisional) => {
+                        debug!(%key, "retransmission while the request is still being handled");
+                        if let Some(bytes) = provisional {
+                            self.transport.send(&bytes, src).await?;
+                        }
+                        return Ok(());
+                    }
+                    Claim::Fresh => {}
                 }
             }
         }
@@ -244,23 +312,61 @@ impl SipCore {
     /// Returns Ok(true) when the request may proceed.  Sends 401 otherwise.
     async fn check_auth(self: &Arc<Self>, req: &Request, src: SocketAddr) -> Result<bool> {
         let Some(cred_cfg) = &self.cfg.sip.auth else { return Ok(true) };
-        // In-dialog requests ride on the credentials of the initial one.
+        // RFC 3261 §22.1: a UAS must not challenge a CANCEL - it has to be
+        // accepted on the strength of the INVITE transaction it matches, and
+        // UAs that do not copy the Authorization across would otherwise never
+        // be able to hang up a call that is still ringing.
+        if req.method == Method::Cancel {
+            return Ok(true);
+        }
+        // In-dialog requests ride on the credentials of the initial one.  The
+        // gateway re-checks that the tags really are the ones it issued
+        // before acting on them.
         if req.headers.to().and_then(|t| t.tag().map(str::to_string)).is_some()
-            && matches!(req.method, Method::Bye | Method::Info | Method::Cancel)
+            && matches!(req.method, Method::Bye | Method::Info)
         {
             return Ok(true);
         }
         let provided = req.headers.get("authorization").and_then(Credentials::parse);
+        // `stale` means "the credentials were right, only the nonce was not",
+        // which tells a UA to retry silently instead of asking the user for a
+        // password it already has.
+        let mut stale = false;
         let ok = match &provided {
             Some(c) => {
                 let user_ok = c.username == cred_cfg.username;
+                // The digest covers the realm and the URI the client claims
+                // to be addressing, so both have to be the ones we asked for
+                // - otherwise a response computed for one request authorises
+                // any other.
+                let realm_ok = c.realm == self.domain();
+                // Compared as parsed URIs, not as strings: UAs differ on
+                // scheme case, on which parameters they carry, and some put
+                // the To-URI here rather than the Request-URI.
+                let uri_ok = Uri::parse(&c.uri)
+                    .map(|u| {
+                        let bare = u.bare();
+                        bare == req.uri.bare()
+                            || req.headers.to().map(|t| bare == t.uri.bare()).unwrap_or(false)
+                    })
+                    .unwrap_or(false);
                 let nonce_ok = self.nonce.is_valid(&c.nonce, 300);
                 let digest_ok =
                     auth::verify(c, &cred_cfg.password, req.method.as_str(), &req.body);
-                if !(user_ok && nonce_ok && digest_ok) {
+                let credentials_ok = user_ok && realm_ok && uri_ok && digest_ok;
+                // Claiming the nonce is what consumes it, so it must not
+                // happen for credentials that were going to be rejected
+                // anyway - a wrong password would otherwise burn the nonce
+                // the legitimate client is about to use.
+                let fresh = credentials_ok && nonce_ok && self.claim_nonce(c);
+                stale = credentials_ok && !fresh;
+                if !(credentials_ok && fresh) {
                     debug!(
                         user_ok,
+                        realm_ok,
+                        uri_ok,
                         nonce_ok,
+                        fresh,
                         digest_ok,
                         username = %c.username,
                         uri = %c.uri,
@@ -269,14 +375,13 @@ impl SipCore {
                         "rejecting credentials"
                     );
                 }
-                user_ok && nonce_ok && digest_ok
+                credentials_ok && fresh
             }
             None => false,
         };
         if ok {
             return Ok(true);
         }
-        let stale = provided.map(|c| !self.nonce.is_valid(&c.nonce, 300)).unwrap_or(false);
         let mut resp = self.make_response(req, 401, None);
         resp.headers.set(
             "www-authenticate",
@@ -291,6 +396,33 @@ impl SipCore {
         Ok(false)
     }
 
+    /// Consume one use of the nonce in `creds`.
+    ///
+    /// Digest over UDP is otherwise trivially replayable: the whole
+    /// `Authorization` header can be lifted off the wire and pasted onto a
+    /// different request until the nonce ages out.  With `qop=auth` the
+    /// client supplies a counter, so each value is accepted once and never
+    /// again; without one the nonce itself becomes single-use.
+    fn claim_nonce(&self, creds: &Credentials) -> bool {
+        let nc = creds
+            .nc
+            .as_deref()
+            .and_then(|v| u32::from_str_radix(v.trim(), 16).ok())
+            .unwrap_or(0);
+        let mut seen = self.nonce_seen.lock().unwrap();
+        match seen.get_mut(&creds.nonce) {
+            Some((highest, _)) if nc > *highest => {
+                *highest = nc;
+                true
+            }
+            Some(_) => false,
+            None => {
+                seen.insert(creds.nonce.clone(), (nc, Instant::now()));
+                true
+            }
+        }
+    }
+
     async fn handle_register(self: &Arc<Self>, req: Request, src: SocketAddr) -> Result<()> {
         if !self.check_auth(&req, src).await? {
             return Ok(());
@@ -299,19 +431,28 @@ impl SipCore {
             return self.respond(&req, src, self.make_response(&req, 400, None)).await;
         };
         let aor = to.uri.bare().to_string();
-        let default_expires: u32 =
-            req.headers.get("expires").and_then(|v| v.trim().parse().ok()).unwrap_or(3600);
+        // An unbounded Expires would create a binding that never lapses, so
+        // the registrar decides the lifetime and tells the UA what it got.
+        let default_expires: u32 = req
+            .headers
+            .get("expires")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(MAX_REGISTER_EXPIRES)
+            .min(MAX_REGISTER_EXPIRES);
 
         let contacts = req.headers.get_all("contact");
         if contacts.iter().any(|c| c.trim() == "*") {
             self.registrar.remove_all(&aor);
         } else {
-            for raw in contacts {
-                let Some(contact) = NameAddr::parse(raw) else { continue };
+            // A Contact field may hold a comma separated list, and each entry
+            // carries its own expiry - including the 0 that de-registers it.
+            for raw in contacts.iter().flat_map(|c| split_contacts(c)) {
+                let Some(contact) = NameAddr::parse(&raw) else { continue };
                 let expires = contact
                     .param("expires")
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(default_expires);
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .unwrap_or(default_expires)
+                    .min(MAX_REGISTER_EXPIRES);
                 self.registrar.update(
                     &aor,
                     contact,
@@ -327,7 +468,11 @@ impl SipCore {
         let mut resp = self.make_response(&req, 200, None);
         for b in &bindings {
             let secs = b.expires_at.saturating_duration_since(Instant::now()).as_secs();
-            resp.headers.push("contact", format!("{};expires={}", b.contact, secs));
+            // The stored contact still carries the client's own expires
+            // parameter; ours is the authoritative one, so replace it.
+            let mut contact = b.contact.clone();
+            contact.set_param("expires", Some(&secs.to_string()));
+            resp.headers.push("contact", contact.to_string());
         }
         resp.headers.set("expires", default_expires.to_string());
         self.respond(&req, src, resp).await
@@ -379,9 +524,15 @@ impl SipCore {
         let bytes = resp.encode();
         trace!(%src, ">>>\n{}", String::from_utf8_lossy(&bytes));
 
-        if resp.code >= 200 {
-            if let Some(key) = txn_key(req) {
-                self.server_cache.lock().unwrap().insert(key, (bytes.clone(), Instant::now()));
+        if let Some(key) = txn_key(req) {
+            let mut cache = self.server_cache.lock().unwrap();
+            if resp.code >= 200 {
+                cache.insert(key, ServerTxn::Completed(bytes.clone(), Instant::now()));
+            } else if let Some(ServerTxn::InProgress { provisional, .. }) = cache.get_mut(&key) {
+                // Keep the latest provisional so a retransmission of the
+                // request can be answered with it instead of being swallowed.
+                // Receiving it is what stops the caller retransmitting.
+                *provisional = Some(bytes.clone());
             }
         }
         self.transport.send(&bytes, src).await
@@ -399,10 +550,10 @@ impl SipCore {
 
         let (tx, rx) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
-        self.client_txns
-            .lock()
-            .unwrap()
-            .insert(branch.clone(), ClientTxnEntry { tx, stop_retransmit: stop.clone() });
+        self.client_txns.lock().unwrap().insert(
+            branch.clone(),
+            ClientTxnEntry { method: req.method, tx, stop_retransmit: stop.clone() },
+        );
 
         self.transport.send(&bytes, dest).await?;
 
@@ -534,6 +685,64 @@ pub fn refresh_via_branch(headers: &mut Headers) {
     }
 }
 
+/// What to do with a request whose transaction may already be known.
+#[derive(Debug, PartialEq, Eq)]
+enum Claim {
+    /// Not seen before (or long expired): run the handler.
+    Fresh,
+    /// Still being handled; this copy is a retransmission.  RFC 3261 §17.2.1
+    /// says to re-send the most recent provisional, which is what stops the
+    /// caller retransmitting; with nothing to send yet the copy is dropped.
+    InFlight(Option<Vec<u8>>),
+    /// Already answered; replay these bytes.
+    Answered(Vec<u8>),
+}
+
+/// Take ownership of a server transaction, or say why we cannot.
+///
+/// Claiming happens before any work starts, not after the response exists:
+/// a MESSAGE that spends seconds at the modem would otherwise be handled once
+/// per retransmission and send the SMS several times.
+fn claim_txn(cache: &mut HashMap<String, ServerTxn>, key: &str, now: Instant) -> Claim {
+    match cache.get(key) {
+        Some(txn) if now.duration_since(txn.started()) < TXN_LIFETIME => match txn {
+            ServerTxn::Completed(bytes, _) => Claim::Answered(bytes.clone()),
+            ServerTxn::InProgress { provisional, .. } => Claim::InFlight(provisional.clone()),
+        },
+        // Anything older than the transaction lifetime is a stale collision
+        // from a UA that restarted its branch counter, not a retransmission.
+        _ => {
+            cache.insert(key.to_string(), ServerTxn::InProgress { since: now, provisional: None });
+            Claim::Fresh
+        }
+    }
+}
+
+/// Split one Contact header field into its comma separated entries.
+///
+/// Commas inside `<...>` or a quoted display name are part of the value, so a
+/// naive `split(',')` would corrupt them.
+fn split_contacts(field: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let (mut in_angle, mut in_quote) = (false, false);
+    for (i, c) in field.char_indices() {
+        match c {
+            '"' if !in_angle => in_quote = !in_quote,
+            '<' if !in_quote => in_angle = true,
+            '>' if !in_quote => in_angle = false,
+            ',' if !in_angle && !in_quote => {
+                out.push(field[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(field[start..].trim().to_string());
+    out.retain(|s| !s.is_empty());
+    out
+}
+
 /// Transaction identity for server-side retransmission detection.
 fn txn_key(req: &Request) -> Option<String> {
     let branch = req.headers.top_via().and_then(|v| v.branch().map(str::to_string))?;
@@ -591,5 +800,85 @@ mod tests {
         assert!(!ip_matches("192.168.1.0/24", "192.168.2.42".parse().unwrap()));
         assert!(ip_matches("10.0.0.1", "10.0.0.1".parse().unwrap()));
         assert!(ip_matches("0.0.0.0/0", "8.8.8.8".parse().unwrap()));
+    }
+
+    /// A Contact field may be a comma separated list, and splitting it wrong
+    /// turns "de-register this one" into "register it for an hour".
+    #[test]
+    fn contact_lists_split_on_the_right_commas() {
+        assert_eq!(
+            split_contacts("<sip:a@h>;expires=0, <sip:b@h>;expires=3600"),
+            vec!["<sip:a@h>;expires=0", "<sip:b@h>;expires=3600"]
+        );
+        assert_eq!(split_contacts("<sip:a@h>"), vec!["<sip:a@h>"]);
+        // Commas inside a quoted display name or angle brackets are literal.
+        assert_eq!(
+            split_contacts("\"Smith, John\" <sip:j@h>, <sip:b@h>"),
+            vec!["\"Smith, John\" <sip:j@h>", "<sip:b@h>"]
+        );
+        assert_eq!(split_contacts("<sip:a@h;x=1,2>"), vec!["<sip:a@h;x=1,2>"]);
+        assert!(split_contacts("  ").is_empty());
+    }
+
+    /// A CANCEL reuses the INVITE's branch, so the transaction key has to
+    /// keep them apart or its 200 OK lands in the INVITE's transaction.
+    #[test]
+    fn transaction_keys_separate_cancel_from_invite() {
+        let raw = |method: &str| {
+            let text = format!(
+                "{method} sip:x@gw SIP/2.0\r\nVia: SIP/2.0/UDP h;branch=z9hG4bK1\r\n\
+                 From: <sip:a@h>;tag=1\r\nTo: <sip:x@gw>\r\nCall-ID: c\r\n\
+                 CSeq: 7 {method}\r\n\r\n"
+            );
+            match Message::parse(text.as_bytes()).unwrap() {
+                Message::Request(r) => r,
+                _ => panic!("expected a request"),
+            }
+        };
+        assert_ne!(txn_key(&raw("INVITE")), txn_key(&raw("CANCEL")));
+        assert_eq!(txn_key(&raw("INVITE")), txn_key(&raw("INVITE")));
+    }
+
+    /// A retransmitted request has to be recognised while it is still being
+    /// handled, not only once it has been answered - a MESSAGE that takes a
+    /// few seconds at the modem used to send the SMS once per retransmission.
+    #[test]
+    fn a_transaction_is_claimed_before_the_work_starts() {
+        let mut cache = HashMap::new();
+        let key = "z9hG4bK1|7|MESSAGE";
+        let t0 = Instant::now();
+
+        assert_eq!(claim_txn(&mut cache, key, t0), Claim::Fresh, "the first copy is handled");
+        // A retransmission arriving while the modem is still sending the SMS
+        // must not reach the handler a second time.
+        assert_eq!(
+            claim_txn(&mut cache, key, t0 + Duration::from_millis(500)),
+            Claim::InFlight(None)
+        );
+
+        // Once a provisional has gone out, a retransmission gets it again -
+        // that is what stops the caller's own retransmission timer.
+        cache.insert(
+            key.to_string(),
+            ServerTxn::InProgress { since: t0, provisional: Some(b"SIP/2.0 100".to_vec()) },
+        );
+        assert_eq!(
+            claim_txn(&mut cache, key, t0 + Duration::from_secs(4)),
+            Claim::InFlight(Some(b"SIP/2.0 100".to_vec()))
+        );
+
+        cache.insert(key.to_string(), ServerTxn::Completed(b"SIP/2.0 202".to_vec(), t0));
+        assert_eq!(
+            claim_txn(&mut cache, key, t0 + Duration::from_secs(1)),
+            Claim::Answered(b"SIP/2.0 202".to_vec()),
+            "once answered, a copy replays the answer"
+        );
+
+        // Past the transaction lifetime the entry is a stale collision from a
+        // UA that restarted its branch counter, not a retransmission - it must
+        // not have a minutes-old response replayed at it.
+        assert_eq!(claim_txn(&mut cache, key, t0 + TXN_LIFETIME * 2), Claim::Fresh);
+        // A different transaction is never confused with this one.
+        assert_eq!(claim_txn(&mut cache, "z9hG4bK1|8|MESSAGE", t0), Claim::Fresh);
     }
 }

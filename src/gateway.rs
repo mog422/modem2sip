@@ -32,7 +32,7 @@ use crate::state::Shared;
 enum Internal {
     SipProgress { call_id: String, code: u16 },
     SipAnswered { call_id: String, resp: Box<Response> },
-    SipFailed { call_id: String, code: u16 },
+    SipFailed { call_id: String, resp: Box<Response> },
     RingTimeout { call_id: String },
     /// An RFC 2833 digit arrived in the RTP stream (SIP -> modem).
     Dtmf { call_id: String, digit: char },
@@ -71,6 +71,9 @@ struct ActiveCall {
     local_rtp_port: u16,
     codec: Codec,
     remote_sdp: Option<Sdp>,
+    /// The telephone-event payload type the running media session decodes.
+    /// Fixed when the session starts, so a re-INVITE cannot move it.
+    media_dtmf_pt: Option<u8>,
 
     answered: bool,
     ringing_sent: bool,
@@ -109,6 +112,7 @@ pub async fn run(
     core: Arc<SipCore>,
     mut sip_rx: mpsc::Receiver<SipEvent>,
     mut modem_rx: mpsc::Receiver<ModemEvent>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let (internal_tx, mut internal_rx) = mpsc::channel::<Internal>(64);
     let mut gw = Gateway {
@@ -124,6 +128,18 @@ pub async fn run(
 
     loop {
         tokio::select! {
+            // Leaving a call up on the way out strands the mobile leg on the
+            // network - connected, silent and still billed - so it is hung up
+            // before the process goes away.
+            _ = &mut shutdown => {
+                if gw.call.is_some() {
+                    gw.teardown_call("modem2sip is shutting down", 200).await;
+                    // The BYE goes out from a task of its own; give it long
+                    // enough to reach the socket before the process exits.
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                break;
+            }
             _ = watchdog.tick() => gw.check_media().await,
             Some(ev) = sip_rx.recv() => {
                 let SipEvent::Request { req, src } = ev;
@@ -296,6 +312,7 @@ impl Gateway {
             local_rtp_port: port,
             codec: Codec::Pcmu,
             remote_sdp: None,
+            media_dtmf_pt: None,
             answered: false,
             ringing_sent: false,
             cdr_id,
@@ -355,44 +372,24 @@ impl Gateway {
 
     /// The mobile network reports the call as connected.
     async fn on_modem_answered(&mut self) -> Result<()> {
-        let Some((role, cdr_id, remote_sdp, codec, peer)) = self.call.as_ref().map(|c| {
-            (c.role, c.cdr_id, c.remote_sdp.clone(), c.codec, c.peer_number.clone())
-        }) else {
+        let Some((role, cdr_id, peer)) =
+            self.call.as_ref().map(|c| (c.role, c.cdr_id, c.peer_number.clone()))
+        else {
             return Ok(());
         };
-        if let Some(c) = self.call.as_mut() {
-            c.answered = true;
-        }
-        if let Some(id) = cdr_id {
-            let _ = self.shared.db.call_answered(id).await;
-        }
 
         match role {
             Role::FromSip => {
-                // Answer the SIP side now that the network is through.
-                let remote_sdp = remote_sdp.ok_or_else(|| anyhow!("no remote SDP"))?;
-                let remote_media = SocketAddr::new(remote_sdp.address, remote_sdp.port);
-                self.start_media(remote_media, codec).await?;
-
-                let dtmf_pt = self.shared.cfg.rtp.dtmf_payload_type;
-                let ptime = self.shared.cfg.audio.period_ms;
-                let core = self.core.clone();
-                let Some(call) = self.call.as_ref() else { return Ok(()) };
-                let advertised = core.transport.advertised_ip(call.remote_addr);
-                let answer = remote_sdp.answer(
-                    advertised,
-                    call.local_rtp_port,
-                    codec,
-                    Some(dtmf_pt),
-                    ptime,
-                );
-                let src = call.invite_src.unwrap_or(call.remote_addr);
-                let mut resp = core.make_response(&call.invite, 200, None);
-                resp.headers.set("content-type", "application/sdp");
-                resp.headers.set("to", call.local.to_string());
-                resp.headers.set("allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, INFO, MESSAGE");
-                resp.body = answer.to_string().into_bytes();
-                core.respond(&call.invite, src, resp).await?;
+                // Answering the SIP side can still fail (the sound card may
+                // be gone).  If it does the mobile leg is live and billed
+                // while the caller has had no final response at all, so the
+                // whole call has to come down rather than the error just
+                // being logged by the event loop.
+                if let Err(e) = self.answer_sip_caller().await {
+                    error!(error = %format!("{e:#}"), "could not answer the SIP caller");
+                    self.teardown_call("answering the SIP caller failed", 500).await;
+                    return Ok(());
+                }
                 info!(peer = %peer, "call answered by the network");
             }
             Role::ToSip => {
@@ -400,7 +397,40 @@ impl Gateway {
                 info!(peer = %peer, "modem call is active");
             }
         }
+
+        if let Some(c) = self.call.as_mut() {
+            c.answered = true;
+        }
+        if let Some(id) = cdr_id {
+            let _ = self.shared.db.call_answered(id).await;
+        }
         Ok(())
+    }
+
+    /// Send the 200 OK that connects a SIP -> modem call, media first.
+    async fn answer_sip_caller(&mut self) -> Result<()> {
+        let Some((remote_sdp, codec)) =
+            self.call.as_ref().map(|c| (c.remote_sdp.clone(), c.codec))
+        else {
+            return Ok(());
+        };
+        let remote_sdp = remote_sdp.ok_or_else(|| anyhow!("no remote SDP"))?;
+        let remote_media = SocketAddr::new(remote_sdp.address, remote_sdp.port);
+        self.start_media(remote_media, codec).await?;
+
+        let dtmf_pt = self.shared.cfg.rtp.dtmf_payload_type;
+        let ptime = self.shared.cfg.audio.period_ms;
+        let core = self.core.clone();
+        let call = self.call.as_ref().ok_or_else(|| anyhow!("call vanished"))?;
+        let advertised = core.transport.advertised_ip(call.remote_addr);
+        let answer = remote_sdp.answer(advertised, call.local_rtp_port, codec, Some(dtmf_pt), ptime);
+        let src = call.invite_src.unwrap_or(call.remote_addr);
+        let mut resp = core.make_response(&call.invite, 200, None);
+        resp.headers.set("content-type", "application/sdp");
+        resp.headers.set("to", call.local.to_string());
+        resp.headers.set("allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, INFO, MESSAGE");
+        resp.body = answer.to_string().into_bytes();
+        core.respond(&call.invite, src, resp).await
     }
 
     // -------------------------------------------------------------- SIP side
@@ -434,23 +464,11 @@ impl Gateway {
     }
 
     async fn on_sip_invite(&mut self, req: Request, src: SocketAddr) -> Result<()> {
-        // Re-INVITE inside the existing dialog: accept without changing media.
-        if let Some(call) = &self.call {
+        if let Some(call) = self.call.as_ref() {
+            // `call_id()` is None on a malformed request; comparing straight
+            // against it would make that match an idle gateway's `None`.
             if req.headers.call_id() == Some(call.call_id.as_str()) {
-                let mut resp = self.core.make_response(&req, 200, None);
-                if let Some(sdp) = call.remote_sdp.as_ref() {
-                    let advertised = self.core.transport.advertised_ip(src);
-                    let answer = sdp.answer(
-                        advertised,
-                        call.local_rtp_port,
-                        call.codec,
-                        Some(self.shared.cfg.rtp.dtmf_payload_type),
-                        self.shared.cfg.audio.period_ms,
-                    );
-                    resp.headers.set("content-type", "application/sdp");
-                    resp.body = answer.to_string().into_bytes();
-                }
-                return self.core.respond(&req, src, resp).await;
+                return self.on_sip_reinvite(req, src).await;
             }
             info!("rejecting INVITE: the modem is already on a call");
             return self.reply(&req, src, 486).await;
@@ -474,34 +492,43 @@ impl Gateway {
             warn!(offered = ?remote_sdp.payload_types, "no common codec (PCMU/PCMA required)");
             return self.reply(&req, src, 488).await;
         };
+        if !remote_sdp.has_media() {
+            warn!(port = remote_sdp.port, address = %remote_sdp.address, "INVITE offers no media");
+            return self.reply(&req, src, 488).await;
+        }
 
-        self.reply(&req, src, 100).await?;
-
-        let rtp_ip = self.rtp_bind_ip(src);
-        let (sock, port) = MediaSession::bind_port(
-            rtp_ip,
-            self.shared.cfg.rtp.port_min,
-            self.shared.cfg.rtp.port_max,
-        )
-        .await?;
-
-        let local_tag = crate::sip::auth::random_hex(6);
-        let to = req
-            .headers
-            .to()
-            .ok_or_else(|| anyhow!("INVITE without To"))?
-            .with_tag(&local_tag);
-        let from = req.headers.from().ok_or_else(|| anyhow!("INVITE without From"))?;
+        // Everything that can be rejected has been; from the 100 Trying on,
+        // the caller stops retransmitting and waits for us, so every path out
+        // of here owes it a final response.
+        let (Some(to), Some(from), Some(call_id)) =
+            (req.headers.to(), req.headers.from(), req.headers.call_id().map(str::to_string))
+        else {
+            warn!("INVITE without To/From/Call-ID");
+            return self.reply(&req, src, 400).await;
+        };
+        let to = to.with_tag(&crate::sip::auth::random_hex(6));
         let remote_target = req
             .headers
             .contact()
             .map(|c| c.uri)
             .unwrap_or_else(|| from.uri.clone());
-        let call_id = req
-            .headers
-            .call_id()
-            .ok_or_else(|| anyhow!("INVITE without Call-ID"))?
-            .to_string();
+
+        self.reply(&req, src, 100).await?;
+
+        let rtp_ip = self.rtp_bind_ip(src);
+        let (sock, port) = match MediaSession::bind_port(
+            rtp_ip,
+            self.shared.cfg.rtp.port_min,
+            self.shared.cfg.rtp.port_max,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                error!(error = %format!("{e:#}"), "no RTP port available");
+                return self.reply(&req, src, 500).await;
+            }
+        };
 
         info!(%number, "placing a call through the modem");
         let mm_path = match modem.dial(&number).await {
@@ -531,6 +558,7 @@ impl Gateway {
             local_rtp_port: port,
             codec,
             remote_sdp: Some(remote_sdp),
+            media_dtmf_pt: None,
             answered: false,
             ringing_sent: false,
             cdr_id,
@@ -539,12 +567,83 @@ impl Gateway {
         Ok(())
     }
 
+    /// A second INVITE carrying the Call-ID of the call in progress.
+    ///
+    /// Only one inside the established dialog with a higher CSeq is a real
+    /// re-INVITE.  A repeat of the initial INVITE used to be answered with a
+    /// 200, which told the caller the call was up while the modem was still
+    /// dialling - and a second, different 200 followed once the network
+    /// actually connected.
+    async fn on_sip_reinvite(&mut self, req: Request, src: SocketAddr) -> Result<()> {
+        let Some(call) = self.call.as_ref() else { return Ok(()) };
+        // Until the first INVITE has its final response there is no dialog to
+        // re-negotiate.  On a call we answered the peer also owns the
+        // sequence space of `call.invite`, so anything not numbered above it
+        // is that same INVITE arriving again.  On a call we placed, that
+        // INVITE is ours and the peer's re-INVITE opens a sequence space of
+        // its own, with nothing to compare it against.
+        let pending = !call.answered
+            || (call.role == Role::FromSip
+                && req.headers.cseq().map(|(n, _)| n)
+                    <= call.invite.headers.cseq().map(|(n, _)| n));
+        if pending {
+            // RFC 3261 §14.2: an INVITE is already outstanding on this dialog.
+            debug!("491 for an INVITE while the first one is still in progress");
+            return self.reply(&req, src, 491).await;
+        }
+        if !self.in_dialog(&req) {
+            debug!("481 for an INVITE whose dialog tags do not match the call");
+            return self.reply(&req, src, 481).await;
+        }
+
+        let offer = Sdp::parse(&req.body_str()).filter(|s| s.has_media());
+        // Switching codec would mean tearing the audio down and rebuilding
+        // it; refusing is honest, and no real peer re-offers a narrower list
+        // mid-call.
+        if let Some(o) = offer.as_ref() {
+            if !o.payload_types.contains(&call.codec.payload_type()) {
+                warn!(offered = ?o.payload_types, current = ?call.codec,
+                      "re-INVITE drops the codec in use");
+                return self.reply(&req, src, 488).await;
+            }
+        }
+
+        // Follow the peer if it moved its RTP endpoint (hold, resume, or a
+        // transfer that re-homed the media).
+        if let (Some(o), Some(media)) = (offer.as_ref(), call.media.as_ref()) {
+            let remote = SocketAddr::new(o.address, o.port);
+            info!(%remote, "re-INVITE moved the remote media endpoint");
+            media.set_remote(remote);
+        }
+
+        let base = offer.clone().or_else(|| call.remote_sdp.clone());
+        let mut resp = self.core.make_response(&req, 200, None);
+        resp.headers.set("to", call.local.to_string());
+        if let Some(sdp) = base.as_ref() {
+            // The running media session decodes the telephone-event payload
+            // type it was started with.  If the new offer moved it we cannot
+            // receive those digits, so the answer stays quiet about it rather
+            // than promising a payload type nothing is listening for.
+            let dtmf_pt = call.media_dtmf_pt.filter(|pt| sdp.telephone_event == Some(*pt));
+            let advertised = self.core.transport.advertised_ip(src);
+            let answer = sdp.answer(
+                advertised,
+                call.local_rtp_port,
+                call.codec,
+                dtmf_pt,
+                self.shared.cfg.audio.period_ms,
+            );
+            resp.headers.set("content-type", "application/sdp");
+            resp.body = answer.to_string().into_bytes();
+        }
+        if let (Some(call), Some(sdp)) = (self.call.as_mut(), offer) {
+            call.remote_sdp = Some(sdp);
+        }
+        self.core.respond(&req, src, resp).await
+    }
+
     async fn on_sip_bye(&mut self, req: Request, src: SocketAddr) -> Result<()> {
-        let matches = self
-            .call
-            .as_ref()
-            .map(|c| Some(c.call_id.as_str()) == req.headers.call_id())
-            .unwrap_or(false);
+        let matches = self.in_dialog(&req);
         let code = if matches { 200 } else { 481 };
         let resp = self.core.make_response(&req, code, None);
         self.core.respond(&req, src, resp).await?;
@@ -564,10 +663,16 @@ impl Gateway {
         let resp = self.core.make_response(&req, 200, None);
         self.core.respond(&req, src, resp).await?;
 
+        // A CANCEL has no To tag - it matches the INVITE *transaction*, so
+        // the Call-ID and the INVITE's sequence number are what identify it.
         let matches = self
             .call
             .as_ref()
-            .map(|c| Some(c.call_id.as_str()) == req.headers.call_id())
+            .map(|c| {
+                Some(c.call_id.as_str()) == req.headers.call_id()
+                    && req.headers.cseq().map(|(n, _)| n)
+                        == c.invite.headers.cseq().map(|(n, _)| n)
+            })
             .unwrap_or(false);
         if matches {
             info!("SIP peer cancelled the call");
@@ -592,11 +697,7 @@ impl Gateway {
         let body = req.body_str();
         let digits = parse_dtmf_info(req.headers.content_type().unwrap_or(""), &body);
         // Only accept INFO for the dialog that owns the current call.
-        let in_dialog = self
-            .call
-            .as_ref()
-            .map(|c| Some(c.call_id.as_str()) == req.headers.call_id())
-            .unwrap_or(false);
+        let in_dialog = self.in_dialog(&req);
         let mm_path = if in_dialog {
             self.call.as_ref().and_then(|c| c.mm_path.clone())
         } else {
@@ -726,11 +827,12 @@ impl Gateway {
                 }
                 self.on_sip_answered(*resp).await
             }
-            Internal::SipFailed { call_id, code } => {
+            Internal::SipFailed { call_id, resp } => {
                 if !self.call_id_matches(&call_id) {
                     return Ok(());
                 }
-                warn!(code, "the SIP side rejected the call");
+                warn!(code = resp.code, "the SIP side rejected the call");
+                self.ack_failure(&resp).await;
                 if let (Some(modem), Some(path)) =
                     (self.modem.clone(), self.call.as_ref().and_then(|c| c.mm_path.clone()))
                 {
@@ -837,6 +939,31 @@ impl Gateway {
         self.call.as_ref().map(|c| c.call_id == call_id).unwrap_or(false)
     }
 
+    /// Does `req` belong to the dialog of the call in progress?
+    fn in_dialog(&self, req: &Request) -> bool {
+        self.call.as_ref().map(|c| in_dialog_of(c, req)).unwrap_or(false)
+    }
+
+    /// RFC 3261 §17.1.1.3: a non-2xx final response to an INVITE has to be
+    /// ACKed by the transaction, reusing the INVITE's branch and taking the
+    /// To header (with the peer's tag) from the response.  Without it the
+    /// peer retransmits the rejection for 32 s and logs a timeout.
+    async fn ack_failure(&self, resp: &Response) {
+        let Some(call) = self.call.as_ref() else { return };
+        if call.role != Role::ToSip {
+            return;
+        }
+        let mut ack = call.invite.clone();
+        ack.method = Method::Ack;
+        ack.body.clear();
+        ack.headers.remove("content-type");
+        ack.headers.set("cseq", format!("{} ACK", call.local_cseq));
+        if let Some(to) = resp.headers.get("to") {
+            ack.headers.set("to", to.to_string());
+        }
+        let _ = self.core.send_raw(&ack, call.remote_addr).await;
+    }
+
     /// Our INVITE (modem -> SIP) was answered with a 2xx.
     async fn on_sip_answered(&mut self, resp: Response) -> Result<()> {
         if self.call.is_none() {
@@ -865,9 +992,18 @@ impl Gateway {
         };
         self.core.send_raw(&ack, dest).await?;
 
-        let Some(sdp) = Sdp::parse(&resp.body_str()) else {
-            warn!("2xx without SDP; dropping the call");
-            self.teardown_call("no SDP in the answer", 200).await;
+        // The dialog is established the moment that ACK goes out, so every
+        // failure below has to end it with a BYE.  Leaving `answered` false
+        // until the modem picks up would make teardown send a CANCEL for a
+        // transaction that is already complete, and the peer would sit on a
+        // call the gateway has forgotten.
+        if let Some(call) = self.call.as_mut() {
+            call.answered = true;
+        }
+
+        let Some(sdp) = Sdp::parse(&resp.body_str()).filter(|s| s.has_media()) else {
+            warn!("2xx without a usable SDP answer; dropping the call");
+            self.teardown_call("no media in the answer", 200).await;
             return Ok(());
         };
         let codec = sdp.negotiate().unwrap_or(Codec::Pcmu);
@@ -894,11 +1030,8 @@ impl Gateway {
                 return Ok(());
             }
         }
-        if let Some(call) = self.call.as_mut() {
-            call.answered = true;
-            if let Some(id) = call.cdr_id {
-                let _ = self.shared.db.call_answered(id).await;
-            }
+        if let Some(id) = self.call.as_ref().and_then(|c| c.cdr_id) {
+            let _ = self.shared.db.call_answered(id).await;
         }
         info!("call connected (modem -> SIP)");
         Ok(())
@@ -967,6 +1100,7 @@ impl Gateway {
             card_rate: self.shared.cfg.audio.rate,
             period_ms: self.shared.cfg.audio.period_ms,
             periods: self.shared.cfg.audio.periods,
+            jitter_ms: self.shared.cfg.rtp.jitter_ms,
             tx_gain: self.shared.cfg.audio.tx_gain,
             rx_gain: self.shared.cfg.audio.rx_gain,
         };
@@ -982,6 +1116,7 @@ impl Gateway {
         let call = self.call.as_mut().ok_or_else(|| anyhow!("call vanished"))?;
         let sock = call.rtp_socket.take().ok_or_else(|| anyhow!("no RTP socket"))?;
         let dtmf_payload_type = call.remote_sdp.as_ref().and_then(|s| s.telephone_event);
+        call.media_dtmf_pt = dtmf_payload_type;
 
         let (dtmf_tx, mut dtmf_rx) = mpsc::channel::<char>(16);
         let (inband_tx, mut inband_rx) = mpsc::channel::<char>(16);
@@ -1072,7 +1207,10 @@ impl Gateway {
         } else {
             match snap.role {
                 Role::FromSip => {
-                    let mut resp = self.core.make_response(&snap.invite, code.max(400), None);
+                    // The caller never got a 2xx, so it needs a failure code:
+                    // a "normal end" here just means we could not complete it.
+                    let code = if code < 400 { 480 } else { code };
+                    let mut resp = self.core.make_response(&snap.invite, code, None);
                     resp.headers.set("to", snap.local_header);
                     if code == 503 {
                         resp.headers
@@ -1418,7 +1556,7 @@ async fn invite_response_task(
                 return;
             }
             Some(resp) => {
-                let _ = tx.send(Internal::SipFailed { call_id, code: resp.code }).await;
+                let _ = tx.send(Internal::SipFailed { call_id, resp: Box::new(resp) }).await;
                 return;
             }
             None => {
@@ -1426,6 +1564,28 @@ async fn invite_response_task(
                 return;
             }
         }
+    }
+}
+
+/// Does `req` belong to `call`'s dialog?
+///
+/// The Call-ID alone is not enough: it travels in the clear on every packet
+/// of the call, so matching on it would let anyone who can reach the SIP port
+/// hang the call up with a BYE or push digits into it with an INFO.  A dialog
+/// is identified by the Call-ID *and* both tags.
+fn in_dialog_of(call: &ActiveCall, req: &Request) -> bool {
+    if req.headers.call_id() != Some(call.call_id.as_str()) {
+        return false;
+    }
+    let to_tag = req.headers.to().and_then(|t| t.tag().map(str::to_string));
+    let from_tag = req.headers.from().and_then(|f| f.tag().map(str::to_string));
+    if call.local.tag().is_some() && to_tag.as_deref() != call.local.tag() {
+        return false;
+    }
+    // The peer's tag is only known once it has answered or offered one.
+    match call.remote.tag() {
+        Some(remote) => from_tag.as_deref() == Some(remote),
+        None => true,
     }
 }
 
@@ -1579,5 +1739,74 @@ mod tests {
     fn alsa_device_normalisation() {
         assert_eq!(normalise_alsa("/dev/snd/pcmC1D0c"), "plughw:1,0");
         assert_eq!(normalise_alsa("hw:2,0"), "hw:2,0");
+    }
+
+    fn request(method: Method, headers: &[(&str, &str)]) -> Request {
+        let mut req = Request::new(method, Uri::parse("sip:gw").unwrap());
+        for (k, v) in headers {
+            req.headers.push(k, v.to_string());
+        }
+        req
+    }
+
+    /// A call the gateway answered as the UAS: our tag is on the To header of
+    /// everything the peer sends back.
+    fn answered_call() -> ActiveCall {
+        ActiveCall {
+            role: Role::FromSip,
+            mm_path: None,
+            peer_number: "+8210".into(),
+            call_id: "call-1".into(),
+            local: NameAddr::parse("<sip:gw@h>;tag=ours").unwrap(),
+            remote: NameAddr::parse("<sip:alice@h>;tag=theirs").unwrap(),
+            remote_target: Uri::parse("sip:alice@h").unwrap(),
+            remote_addr: "10.0.0.5:5060".parse().unwrap(),
+            local_cseq: 1,
+            invite: request(Method::Invite, &[("call-id", "call-1"), ("cseq", "1 INVITE")]),
+            invite_src: None,
+            media: None,
+            rtp_socket: None,
+            local_rtp_port: 16384,
+            codec: Codec::Pcmu,
+            remote_sdp: None,
+            media_dtmf_pt: None,
+            answered: true,
+            ringing_sent: true,
+            cdr_id: None,
+            tasks: Vec::new(),
+        }
+    }
+
+    fn bye(to: &str, from: &str, call_id: &str) -> Request {
+        request(Method::Bye, &[("call-id", call_id), ("to", to), ("from", from)])
+    }
+
+    /// Matching in-dialog requests on the Call-ID alone let anyone who could
+    /// see one packet of the call tear it down or push digits into it.
+    #[test]
+    fn in_dialog_requires_both_tags() {
+        let call = answered_call();
+        assert!(in_dialog_of(&call, &bye("<sip:gw@h>;tag=ours", "<sip:a@h>;tag=theirs", "call-1")));
+
+        // Right Call-ID, guessed or absent tags.
+        for wrong in [
+            bye("<sip:gw@h>;tag=guess", "<sip:a@h>;tag=theirs", "call-1"),
+            bye("<sip:gw@h>", "<sip:a@h>;tag=theirs", "call-1"),
+            bye("<sip:gw@h>;tag=ours", "<sip:eve@h>;tag=other", "call-1"),
+            bye("<sip:gw@h>;tag=ours", "<sip:a@h>", "call-1"),
+            bye("<sip:gw@h>;tag=ours", "<sip:a@h>;tag=theirs", "another-call"),
+        ] {
+            assert!(!in_dialog_of(&call, &wrong), "accepted {:?}", wrong.headers);
+        }
+    }
+
+    /// Before the peer has offered a tag there is nothing to compare, so only
+    /// ours is checked - otherwise a legitimate early BYE would be refused.
+    #[test]
+    fn in_dialog_tolerates_an_unknown_remote_tag() {
+        let mut call = answered_call();
+        call.remote = NameAddr::parse("<sip:alice@h>").unwrap();
+        assert!(in_dialog_of(&call, &bye("<sip:gw@h>;tag=ours", "<sip:a@h>;tag=x", "call-1")));
+        assert!(!in_dialog_of(&call, &bye("<sip:gw@h>;tag=no", "<sip:a@h>;tag=x", "call-1")));
     }
 }

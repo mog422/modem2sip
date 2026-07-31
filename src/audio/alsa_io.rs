@@ -34,6 +34,8 @@ pub struct AudioParams {
     pub card_rate: u32,
     pub period_ms: u32,
     pub periods: u32,
+    /// Target buffering depth; also the backlog the rings are trimmed to.
+    pub jitter_ms: u32,
     pub tx_gain: f32,
     pub rx_gain: f32,
 }
@@ -49,13 +51,41 @@ pub struct AudioRings {
     /// lasts.  Replacing rather than mixing keeps the tone clean for the
     /// detector at the far end.
     tone: Mutex<VecDeque<i16>>,
+    /// Backlog each ring is trimmed back to once it runs long.
+    target: usize,
+    /// Backlog that triggers a trim.
+    high_water: usize,
     pub underruns: AtomicU64,
     pub overruns: AtomicU64,
 }
 
-const MAX_RING_SAMPLES: usize = RTP_RATE as usize; // one second
+/// Hard ceiling on queued DTMF, in samples (~8 s at 8 kHz).
+const MAX_TONE_SAMPLES: usize = RTP_RATE as usize * 8;
 
 impl AudioRings {
+    /// Sized from the target jitter depth: that is how much delay the call is
+    /// meant to carry, and anything beyond it is drift to be given back.
+    fn new(jitter_ms: u32, period_ms: u32) -> Self {
+        let ms = |n: u32| (RTP_RATE as usize * n as usize) / 1000;
+        let target = ms(jitter_ms.max(period_ms)).max(ms(20));
+        Self { target, high_water: target * 3, ..Default::default() }
+    }
+
+    /// Give back the delay a ring has accumulated beyond its target.
+    ///
+    /// The card's crystal and the packet clock never run at exactly the same
+    /// rate, and a scheduling hiccup adds a step change on top, so one side
+    /// always drifts. Dropping a single sample per push only ever pinned the
+    /// backlog at the ceiling, leaving the rest of the call with that much
+    /// delay and no way back; trimming to the target restores it in one go.
+    fn trim(&self, ring: &mut VecDeque<i16>) {
+        if ring.len() > self.high_water {
+            let excess = ring.len() - self.target;
+            ring.drain(..excess);
+            self.overruns.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Take exactly `n` samples for the network, padding with silence when
     /// the card has not produced enough yet (call setup, xrun recovery).
     pub fn take_for_network(&self, n: usize) -> Vec<i16> {
@@ -74,29 +104,28 @@ impl AudioRings {
     fn push_from_card(&self, samples: &[i16]) {
         let mut ring = self.to_network.lock().unwrap();
         ring.extend(samples.iter().copied());
-        while ring.len() > MAX_RING_SAMPLES {
-            ring.pop_front();
-            self.overruns.fetch_add(1, Ordering::Relaxed);
-        }
+        self.trim(&mut ring);
     }
 
     /// Feed decoded RTP audio towards the modem.
     pub fn push_from_network(&self, samples: &[i16]) {
         let mut ring = self.to_modem.lock().unwrap();
         ring.extend(samples.iter().copied());
-        while ring.len() > MAX_RING_SAMPLES {
-            ring.pop_front();
-            self.overruns.fetch_add(1, Ordering::Relaxed);
-        }
+        self.trim(&mut ring);
     }
 
     /// Queue locally generated uplink audio (a DTMF digit).
-    pub fn queue_tone(&self, samples: &[i16]) {
+    ///
+    /// Returns false when the queue is full: dropping the head would cut a
+    /// tone in half, so a caller pasting a long PIN is told the tail did not
+    /// fit rather than being handed a corrupted string.
+    pub fn queue_tone(&self, samples: &[i16]) -> bool {
         let mut tone = self.tone.lock().unwrap();
-        tone.extend(samples.iter().copied());
-        while tone.len() > MAX_RING_SAMPLES * 4 {
-            tone.pop_front();
+        if tone.len() + samples.len() > MAX_TONE_SAMPLES {
+            return false;
         }
+        tone.extend(samples.iter().copied());
+        true
     }
 
     pub fn tone_pending(&self) -> bool {
@@ -148,7 +177,7 @@ pub struct AudioStream {
 impl AudioStream {
     /// Blocking: opens both directions and returns once audio is flowing.
     pub fn start(params: AudioParams) -> Result<Self> {
-        let rings = Arc::new(AudioRings::default());
+        let rings = Arc::new(AudioRings::new(params.jitter_ms, params.period_ms));
         let stop = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(&'static str, u32), String>>();
@@ -172,14 +201,20 @@ impl AudioStream {
         let stream = Self { rings, failed, stop, threads };
 
         // Both threads must report success, otherwise the call is not viable.
+        // Whichever one did open has to be shut down and joined before we
+        // give up, or it keeps holding the card and the next call gets EBUSY
+        // from a modem that then looks permanently broken.
         for _ in 0..2 {
-            match ready_rx.recv_timeout(OPEN_TIMEOUT) {
+            let failure = match ready_rx.recv_timeout(OPEN_TIMEOUT) {
                 Ok(Ok((direction, rate))) => {
                     info!(direction, rate, "modem audio open");
+                    continue;
                 }
-                Ok(Err(e)) => return Err(anyhow!("{e}")),
-                Err(_) => return Err(anyhow!("timed out opening the modem sound card")),
-            }
+                Ok(Err(e)) => anyhow!("{e}"),
+                Err(_) => anyhow!("timed out opening the modem sound card"),
+            };
+            stream.shutdown();
+            return Err(failure);
         }
         Ok(stream)
     }
@@ -371,4 +406,53 @@ fn recover(pcm: &PCM, err: alsa::Error, errors: &mut u32, what: &str) -> bool {
     let _ = pcm.prepare();
     debug!(direction = what, error = %description, "recovered from ALSA xrun");
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rings() -> AudioRings {
+        AudioRings::new(60, 20)
+    }
+
+    /// Drift used to pin the backlog at the ceiling for the rest of the call.
+    /// It has to come back down to the target instead.
+    #[test]
+    fn a_ring_that_runs_long_is_trimmed_back_to_the_target() {
+        let r = rings();
+        let target = r.target;
+        for _ in 0..200 {
+            r.push_from_network(&vec![0i16; 160]);
+        }
+        let depth = r.to_modem.lock().unwrap().len();
+        assert!(depth <= r.high_water, "{depth} samples still queued");
+        assert!(depth >= target, "trimmed below the target: {depth} < {target}");
+        // One trim per overflow, not one per dropped sample.
+        assert!(r.overruns.load(Ordering::Relaxed) < 200);
+    }
+
+    /// A backlog inside the target is the jitter buffer doing its job.
+    #[test]
+    fn normal_buffering_is_left_alone() {
+        let r = rings();
+        r.push_from_network(&vec![0i16; 480]); // 60 ms
+        assert_eq!(r.to_modem.lock().unwrap().len(), 480);
+        assert_eq!(r.overruns.load(Ordering::Relaxed), 0);
+    }
+
+    /// Truncating the queue mid-tone corrupted the digit that was cut; the
+    /// caller is told it did not fit instead.
+    #[test]
+    fn a_full_tone_queue_refuses_rather_than_truncating() {
+        let r = rings();
+        let digit = vec![0i16; 2080]; // 260 ms, one digit plus its gap
+        let mut accepted = 0;
+        while r.queue_tone(&digit) {
+            accepted += 1;
+            assert!(accepted < 100, "the queue never filled up");
+        }
+        assert!(accepted > 20, "only {accepted} digits fitted");
+        assert!(r.tone.lock().unwrap().len() <= MAX_TONE_SAMPLES);
+    }
 }

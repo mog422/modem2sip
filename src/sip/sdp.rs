@@ -170,6 +170,15 @@ impl Sdp {
         self.payload_types.iter().find_map(|pt| Codec::from_payload_type(*pt))
     }
 
+    /// Is there somewhere to actually send RTP?
+    ///
+    /// A rejected or held stream is signalled with port 0 or a null
+    /// connection address; accepting one leaves the sender blasting packets
+    /// at 0.0.0.0:0 (which Linux turns into loopback) for the whole call.
+    pub fn has_media(&self) -> bool {
+        self.port != 0 && !self.address.is_unspecified()
+    }
+
     /// Build an answer for `self` (a received offer) using our own transport.
     pub fn answer(&self, address: IpAddr, port: u16, codec: Codec, dtmf_pt: Option<u8>, ptime: u32) -> Sdp {
         let now = chrono::Local::now().timestamp() as u64;
@@ -180,8 +189,10 @@ impl Sdp {
             address,
             port,
             payload_types: vec![codec.payload_type()],
-            // Only echo telephone-event if the peer offered it.
-            telephone_event: self.telephone_event.and(dtmf_pt),
+            // Echo the payload type the peer offered, not our own: an answer
+            // may only name payload types that were in the offer, and the
+            // receive path is keyed on the offered number.
+            telephone_event: dtmf_pt.and(self.telephone_event),
             ptime: Some(ptime),
             sendrecv: Direction::SendRecv,
         }
@@ -241,5 +252,43 @@ mod tests {
         assert_eq!(sdp.negotiate(), Some(Codec::Pcma));
         assert_eq!(sdp.telephone_event, Some(101));
         assert_eq!(sdp.address.to_string(), "10.0.0.5");
+        assert!(sdp.has_media());
+    }
+
+    /// An answer may only name payload types the offer listed.  Advertising
+    /// our own configured number instead left the peer sending digits as one
+    /// type while the receiver was decoding another.
+    #[test]
+    fn the_answer_echoes_the_offered_telephone_event() {
+        let offer = Sdp::parse(
+            "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 40000 RTP/AVP 0 96\r\n\
+             a=rtpmap:96 telephone-event/8000\r\n",
+        )
+        .unwrap();
+        let answer = offer.answer("10.0.0.1".parse().unwrap(), 16000, Codec::Pcmu, Some(101), 20);
+        assert_eq!(answer.telephone_event, Some(96));
+        assert!(answer.to_string().contains("a=rtpmap:96 telephone-event/8000"));
+        assert!(answer.to_string().contains("m=audio 16000 RTP/AVP 0 96"));
+
+        // Nothing offered, nothing answered - either way round.
+        let plain = Sdp::parse("v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 40000 RTP/AVP 0\r\n").unwrap();
+        assert_eq!(
+            plain.answer("10.0.0.1".parse().unwrap(), 16000, Codec::Pcmu, Some(101), 20).telephone_event,
+            None
+        );
+        assert_eq!(
+            offer.answer("10.0.0.1".parse().unwrap(), 16000, Codec::Pcmu, None, 20).telephone_event,
+            None
+        );
+    }
+
+    /// Port 0 or a null address means "no media here"; taking it at face
+    /// value leaves the sender blasting packets at loopback.
+    #[test]
+    fn a_held_or_rejected_stream_has_no_media() {
+        let held = Sdp::parse("v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 0 RTP/AVP 0\r\n").unwrap();
+        assert!(!held.has_media());
+        let null = Sdp::parse("v=0\r\nc=IN IP4 0.0.0.0\r\nm=audio 40000 RTP/AVP 0\r\n").unwrap();
+        assert!(!null.has_media());
     }
 }

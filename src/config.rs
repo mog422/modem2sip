@@ -424,11 +424,39 @@ impl Config {
             .bind
             .parse::<std::net::SocketAddr>()
             .with_context(|| format!("sip.bind is not a socket address: {}", self.sip.bind))?;
+        if self.http.enabled {
+            // Checked here rather than in the HTTP task, where a typo used to
+            // leave the process running with no API while SIP kept handing
+            // out attachment URLs that pointed at it.
+            self.http.bind.parse::<std::net::SocketAddr>().with_context(|| {
+                format!("http.bind is not a socket address: {}", self.http.bind)
+            })?;
+            // An empty token would compare equal to the empty string a
+            // request with no Authorization header presents, i.e. it would
+            // read as "authentication configured" while allowing everything.
+            if let Some(token) = &self.http.token {
+                anyhow::ensure!(!token.is_empty(), "http.token must not be empty");
+            }
+        }
         anyhow::ensure!(self.rtp.port_min < self.rtp.port_max, "rtp.port_min must be < rtp.port_max");
+        anyhow::ensure!(self.rtp.port_min >= 1024, "rtp.port_min must be >= 1024");
+        anyhow::ensure!(
+            self.rtp.dtmf_payload_type >= 96,
+            "rtp.dtmf_payload_type must be a dynamic type (96..127)"
+        );
+        anyhow::ensure!(self.sip.ring_timeout_secs > 0, "sip.ring_timeout_secs must be > 0");
         anyhow::ensure!(self.audio.period_ms > 0, "audio.period_ms must be > 0");
         anyhow::ensure!(self.audio.rate >= 8000, "audio.rate must be >= 8000");
+        anyhow::ensure!(self.audio.periods >= 2, "audio.periods must be >= 2");
+        for (what, gain) in [("tx_gain", self.audio.tx_gain), ("rx_gain", self.audio.rx_gain)] {
+            anyhow::ensure!(
+                gain.is_finite() && (0.0..=16.0).contains(&gain),
+                "audio.{what} must be between 0 and 16"
+            );
+        }
         if self.mms.enabled {
             anyhow::ensure!(self.mms.mmsc.is_some(), "mms.enabled requires mms.mmsc");
+            anyhow::ensure!(self.mms.max_size > 0, "mms.max_size must be > 0");
         }
         if let Some(up) = &self.sip.register {
             anyhow::ensure!(!up.registrar.is_empty(), "sip.register.registrar is required");
@@ -438,6 +466,10 @@ impl Config {
 
     /// The address the SIP server binds to.
     pub fn sip_bind(&self) -> std::net::SocketAddr {
-        self.sip.bind.parse().expect("validated")
+        // `validate` runs on every loaded config; a default-constructed one
+        // (tests, future --check mode) must still not bring the process down.
+        self.sip.bind.parse().unwrap_or_else(|_| {
+            std::net::SocketAddr::from(([0, 0, 0, 0], 5060))
+        })
     }
 }

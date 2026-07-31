@@ -218,10 +218,23 @@ impl<'a> Reader<'a> {
             Some(b as usize)
         } else if b == 0x1F {
             self.pos += 1;
-            self.uintvar().map(|v| v as usize)
+            // A uintvar carries up to 56 bits; saturate rather than truncate
+            // so a 32-bit build cannot wrap the length into something small.
+            self.uintvar().map(|v| usize::try_from(v).unwrap_or(usize::MAX))
         } else {
             None
         }
+    }
+
+    /// Value length that is guaranteed to fit in what is left of the buffer.
+    ///
+    /// The length is a network-supplied field, so `pos + len` must never be
+    /// computed from it directly: on a 32-bit target (the OpenWrt builds) a
+    /// declared length near `usize::MAX` wraps and produces a backwards slice
+    /// range, which panics.
+    pub fn bounded_value_length(&mut self) -> Option<usize> {
+        let len = self.value_length()?;
+        Some(len.min(self.remaining()))
     }
 
     /// Long-integer: length byte followed by that many big-endian bytes.
@@ -254,14 +267,20 @@ impl<'a> Reader<'a> {
         if b == 0x7F {
             return self.text_string();
         }
-        let len = self.value_length()?;
-        let end = (self.pos + len).min(self.data.len());
+        let len = self.bounded_value_length()?;
+        let end = self.pos + len;
         let mut inner = Reader::new(&self.data[self.pos..end]);
         self.pos = end;
         let mib = inner.integer_value().unwrap_or(106) as u32;
+        let encoding = charset_for(mib);
         let raw = &inner.data[inner.pos..];
-        let raw = raw.strip_suffix(&[0u8]).unwrap_or(raw);
-        let (text, _, _) = charset_for(mib).decode(raw);
+        // UTF-16 terminates with two NUL bytes, everything else with one.
+        let terminator = if encoding.name().starts_with("UTF-16") { 2 } else { 1 };
+        let raw = match raw.len().checked_sub(terminator) {
+            Some(cut) if raw[cut..].iter().all(|b| *b == 0) => &raw[..cut],
+            _ => raw,
+        };
+        let (text, _, _) = encoding.decode(raw);
         Some(text.into_owned())
     }
 
@@ -276,8 +295,8 @@ impl<'a> Reader<'a> {
         if b >= 0x20 {
             return self.text_string().map(|t| (t, Vec::new()));
         }
-        let len = self.value_length()?;
-        let end = (self.pos + len).min(self.data.len());
+        let len = self.bounded_value_length()?;
+        let end = self.pos + len;
         let mut inner = Reader::new(&self.data[self.pos..end]);
         self.pos = end;
 
@@ -303,8 +322,13 @@ impl<'a> Reader<'a> {
             let code = b & 0x7F;
             let name = param_name(code).unwrap_or("x-unknown").to_string();
             let value = match code {
+                // No-value parameter: reading it as an integer would eat the
+                // next parameter's first byte and desynchronise the list.
+                0x10 => String::new(),
+                // Q-value: a uintvar, not an integer-value.
+                0x00 => self.uintvar().map(|v| v.to_string()).unwrap_or_default(),
                 // Integer-valued parameters.
-                0x00 | 0x02 | 0x0E | 0x10 | 0x16 => {
+                0x02 | 0x0E | 0x16 => {
                     self.integer_value().map(|v| v.to_string()).unwrap_or_default()
                 }
                 0x01 => {
@@ -332,11 +356,10 @@ impl<'a> Reader<'a> {
     /// Skip a header value of unknown type (WSP §8.4.1.2 rules).
     pub fn skip_value(&mut self) -> Option<()> {
         let b = self.peek()?;
-        if b <= 30 {
-            let len = self.value_length()?;
-            self.take(len)?;
-        } else if b == 0x1F {
-            let len = self.value_length()?;
+        if b <= 30 || b == 0x1F {
+            // A length that overruns the buffer means the PDU is malformed;
+            // consuming the remainder is the only sane recovery.
+            let len = self.bounded_value_length()?;
             self.take(len)?;
         } else if b & 0x80 != 0 {
             self.pos += 1;
@@ -482,5 +505,39 @@ mod tests {
         let (name, params) = r.content_type().unwrap();
         assert_eq!(name, "image/jpeg");
         assert!(params.is_empty());
+    }
+
+    /// A length field that overruns the buffer used to produce a backwards
+    /// slice range on 32-bit targets.  It must clamp, never panic.
+    #[test]
+    fn declared_lengths_cannot_run_past_the_buffer() {
+        // 0x1F + uintvar(0xFFFFFFFF), i.e. "this value is 4 GiB long".
+        const HUGE_LEN: [u8; 6] = [0x1F, 0x8F, 0xFF, 0xFF, 0xFF, 0x7F];
+        let with = |tail: &[u8]| [&HUGE_LEN[..], tail].concat();
+
+        assert_eq!(Reader::new(&HUGE_LEN).bounded_value_length(), Some(0));
+        // charset UTF-8 (0xEA) then the text: only one byte of it arrived.
+        assert_eq!(Reader::new(&with(&[0xEA, b'x'])).encoded_string().as_deref(), Some("x"));
+        assert_eq!(Reader::new(&with(b"text/plain\0")).content_type().unwrap().0, "text/plain");
+        assert!(Reader::new(&with(b"junk")).skip_value().is_some());
+        assert!(Reader::new(&HUGE_LEN).content_type().is_none());
+
+        // Plain short length that is simply longer than what is left.
+        let over = [0x1Eu8, 0xEA, b'a'];
+        assert_eq!(Reader::new(&over).encoded_string().as_deref(), Some("a"));
+        assert_eq!(Reader::new(&over).bounded_value_length(), Some(2));
+    }
+
+    /// 0x10 ("secure") is a No-value parameter; consuming a byte for it used
+    /// to desynchronise everything after it in the list.
+    #[test]
+    fn no_value_parameter_does_not_eat_the_next_one() {
+        let mut buf = vec![0x80 | 0x10]; // secure, no value
+        buf.push(0x80 | 0x05); // name
+        write_text_string(&mut buf, "p.jpg");
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.parameter(), Some(("secure".into(), String::new())));
+        assert_eq!(r.parameter(), Some(("name".into(), "p.jpg".into())));
+        assert!(r.eof());
     }
 }

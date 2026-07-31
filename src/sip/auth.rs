@@ -332,4 +332,42 @@ mod tests {
         assert_eq!(c.qop.as_deref(), Some("auth"));
         assert_eq!(c.algorithm.as_deref(), Some("MD5"));
     }
+
+    /// Answering our own challenge has to verify, or nothing can authenticate
+    /// at all - and the response must be tied to the method and the URI, so
+    /// that one captured header does not authorise a different request.
+    #[test]
+    fn our_own_challenge_round_trips_and_is_bound_to_the_request() {
+        let factory = NonceFactory::new();
+        let challenge = Challenge::parse(&format!(
+            "Digest realm=\"gw.local\", nonce=\"{}\", algorithm=MD5, qop=\"auth\"",
+            factory.issue()
+        ))
+        .unwrap();
+        let creds =
+            answer(&challenge, "gateway", "s3cret", "MESSAGE", "sip:+8210@gw.local", b"hi", 1);
+
+        assert!(factory.is_valid(&creds.nonce, 300));
+        assert_eq!(creds.nc.as_deref(), Some("00000001"));
+        assert!(verify(&creds, "s3cret", "MESSAGE", b"hi"));
+        // Same credentials, different method or password: no.
+        assert!(!verify(&creds, "s3cret", "INVITE", b"hi"));
+        assert!(!verify(&creds, "wrong", "MESSAGE", b"hi"));
+
+        // And the header survives a round trip through the wire format.
+        let reparsed = Credentials::parse(&creds.to_header()).unwrap();
+        assert_eq!(reparsed.uri, "sip:+8210@gw.local");
+        assert_eq!(reparsed.nc.as_deref(), Some("00000001"));
+        assert!(verify(&reparsed, "s3cret", "MESSAGE", b"hi"));
+    }
+
+    #[test]
+    fn a_nonce_we_did_not_issue_is_rejected() {
+        let factory = NonceFactory::new();
+        assert!(!factory.is_valid("1700000000:deadbeef", 300));
+        assert!(!factory.is_valid("not-a-nonce", 300));
+        assert!(!factory.is_valid("", 300));
+        // Another instance has its own secret.
+        assert!(!NonceFactory::new().is_valid(&factory.issue(), 300));
+    }
 }

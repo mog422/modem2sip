@@ -46,26 +46,21 @@ pub struct MediaConfig {
 impl MediaSession {
     /// Bind an even RTP port inside the configured range.
     pub async fn bind_port(ip: IpAddr, min: u16, max: u16) -> Result<(UdpSocket, u16)> {
-        let start = {
-            let span = ((max - min) / 2).max(1);
-            min + 2 * rand::thread_rng().gen_range(0..span)
+        // Every candidate is an even port whose odd RTCP partner is also in
+        // range, so the walk is over `first ..= last` stepping by two.
+        let first = min.saturating_add(1) & !1;
+        let last = match max.checked_sub(1) {
+            Some(m) if m >= first => m & !1,
+            _ => return Err(anyhow!("no even RTP port pair fits in {min}..{max}")),
         };
-        let mut port = start & !1;
-        let first = port;
-        for _ in 0..((max - min) / 2 + 1) {
-            let fits = port >= min && port.checked_add(1).map(|p| p <= max).unwrap_or(false);
-            if fits {
-                if let Ok(sock) = UdpSocket::bind(SocketAddr::new(ip, port)).await {
-                    return Ok((sock, port));
-                }
+        let slots = ((last - first) / 2 + 1) as u32;
+        let mut port = first + 2 * (rand::thread_rng().gen_range(0..slots) as u16);
+
+        for _ in 0..slots {
+            if let Ok(sock) = UdpSocket::bind(SocketAddr::new(ip, port)).await {
+                return Ok((sock, port));
             }
-            port = match port.checked_add(2) {
-                Some(p) if p + 1 <= max => p,
-                _ => (min + 1) & !1, // wrap to the first even port in range
-            };
-            if port == first {
-                break;
-            }
+            port = if port >= last { first } else { port + 2 };
         }
         Err(anyhow!("no free RTP port in {min}..{max}"))
     }
@@ -130,7 +125,12 @@ impl MediaSession {
         for digit in digits.chars().filter(|c| !c.is_whitespace()) {
             match codec::dtmf_samples(digit, tone_ms, RTP_RATE) {
                 Some(tone) => {
-                    self.rings.queue_tone(&tone);
+                    // Stop at the first digit that will not fit rather than
+                    // pushing one in that gets cut short.
+                    if !self.rings.queue_tone(&tone) {
+                        warn!(queued, "the in-band DTMF queue is full; the rest was dropped");
+                        break;
+                    }
                     self.rings.queue_tone(&gap);
                     queued += 1;
                 }
@@ -248,8 +248,12 @@ async fn sender_loop(
         marker = false;
 
         let dest = *remote.lock().unwrap();
-        if let Err(e) = sock.send_to(&packet, dest).await {
-            trace!(error = %e, "RTP send failed");
+        // A held or rejected stream signals 0.0.0.0:0, which the kernel would
+        // happily turn into loopback and get sprayed with call audio.
+        if dest.port() != 0 && !dest.ip().is_unspecified() {
+            if let Err(e) = sock.send_to(&packet, dest).await {
+                trace!(error = %e, "RTP send failed");
+            }
         }
         seq = seq.wrapping_add(1);
         timestamp = timestamp.wrapping_add(samples_per_packet as u32);
@@ -272,15 +276,38 @@ async fn receiver_loop(
     let mut pcm = Vec::with_capacity(320);
     let mut latched = false;
     let mut last_dtmf_ts: Option<u32> = None;
+    let signalled = *remote.lock().unwrap();
 
     while !stop.load(Ordering::Relaxed) {
         let (len, src) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
                 trace!(error = %e, "RTP recv failed");
+                // Some errors (a queued ICMP unreachable, an interface going
+                // away) reproduce on the very next call, which would turn
+                // this into a busy loop that starves the sender.
+                tokio::time::sleep(Duration::from_millis(20)).await;
                 continue;
             }
         };
+
+        // Only the host we signalled with gets to be heard.  The port is
+        // allowed to differ - that is what makes RTP work behind NAT - but a
+        // completely unrelated host must not be able to take over the call
+        // audio by winning a race with the peer's first packet.
+        if !signalled.ip().is_unspecified() && src.ip() != signalled.ip() {
+            trace!(from = %src, expected = %signalled, "ignoring RTP from an unexpected host");
+            continue;
+        }
+        // Symmetric RTP: reply to wherever the peer actually turned out to be.
+        if symmetric && !latched {
+            if src != signalled {
+                debug!(from = %src, previous = %signalled, "latching remote RTP address");
+                *remote.lock().unwrap() = src;
+            }
+            latched = true;
+        }
+
         if len < 12 {
             continue;
         }
@@ -290,6 +317,7 @@ async fn receiver_loop(
         }
         let csrc_count = (header[0] & 0x0F) as usize;
         let has_extension = header[0] & 0x10 != 0;
+        let has_padding = header[0] & 0x20 != 0;
         let pt = header[1] & 0x7F;
         let timestamp = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
 
@@ -304,28 +332,27 @@ async fn receiver_loop(
         if offset >= len {
             continue;
         }
-        let payload = &buf[offset..len];
-
-        // Symmetric RTP: trust the first source we hear from, then stick to it.
-        if symmetric && !latched {
-            let mut cur = remote.lock().unwrap();
-            if *cur != src {
-                debug!(from = %src, previous = %*cur, "latching remote RTP address");
-                *cur = src;
+        // The last byte of a padded packet says how much of the tail is pad;
+        // decoding it would put a click in the audio on every packet.
+        let mut end = len;
+        if has_padding {
+            let pad = buf[len - 1] as usize;
+            if pad == 0 || pad > len - offset {
+                continue;
             }
-            latched = true;
+            end = len - pad;
         }
+        let payload = &buf[offset..end];
 
         if Some(pt) == dtmf_pt {
-            // RFC 2833: event, E|R|volume, duration.  Report once per event.
-            if payload.len() >= 4 {
-                let event = payload[0];
-                let end = payload[1] & 0x80 != 0;
-                if end && last_dtmf_ts != Some(timestamp) {
-                    last_dtmf_ts = Some(timestamp);
-                    if let Some(d) = dtmf_char(event) {
-                        let _ = dtmf_tx.try_send(d);
-                    }
+            // RFC 2833: event, E|R|volume, duration.  Report on the first
+            // packet of an event rather than the end packet - that one is
+            // the likeliest of the burst to be lost, and losing it used to
+            // mean losing the digit entirely.
+            if payload.len() >= 4 && last_dtmf_ts != Some(timestamp) {
+                last_dtmf_ts = Some(timestamp);
+                if let Some(d) = dtmf_char(payload[0]) {
+                    let _ = dtmf_tx.try_send(d);
                 }
             }
             continue;

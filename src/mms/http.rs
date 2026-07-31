@@ -67,16 +67,29 @@ fn parse_url(url: &str) -> Result<Url> {
                 anyhow!("unsupported MMS URL: {url}")
             }
         })?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    // The authority ends at the first '/', '?' or '#'; a content-location of
+    // "http://mmsc.example?id=42" is legal and must not swallow the query
+    // into the host name.
+    let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, rest_of_url) = rest.split_at(split);
+    let path = match rest_of_url {
+        "" => "/".to_string(),
+        p if p.starts_with('/') => p.to_string(),
+        q => format!("/{q}"),
     };
     let authority = authority.rsplit('@').next().unwrap_or(authority);
+    // An IPv6 literal is bracketed, so only a colon after the bracket is a
+    // port separator.
     let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.contains(':') => (h.to_string(), p.parse().unwrap_or(80)),
+        Some((h, p)) if !h.contains(':') || h.ends_with(']') => {
+            (h.to_string(), p.parse().unwrap_or(80))
+        }
         _ => (authority.to_string(), 80),
     };
-    Ok(Url { host, port, path: path.to_string() })
+    if host.is_empty() {
+        bail!("MMS URL has no host: {url}");
+    }
+    Ok(Url { host, port, path })
 }
 
 pub async fn get(url: &str, opts: &HttpOptions) -> Result<HttpResponse> {
@@ -111,10 +124,13 @@ async fn request(
     };
 
     let timeout = if opts.timeout.is_zero() { Duration::from_secs(60) } else { opts.timeout };
-    let addrs = resolve(&connect_host, connect_port, opts).await?;
-    debug!(?addrs, method, url, proxy = ?opts.proxy, "MMS HTTP request");
 
+    // Name resolution is inside the timeout: a carrier resolver that black
+    // holes queries would otherwise stall the caller past mms.timeout_secs,
+    // and the system-resolver fallback has no deadline of its own.
     let fut = async {
+        let addrs = resolve(&connect_host, connect_port, opts).await?;
+        debug!(?addrs, method, url, proxy = ?opts.proxy, "MMS HTTP request");
         let mut stream = connect_any(&addrs, opts).await?;
 
         let mut head = String::new();
@@ -163,6 +179,8 @@ fn host_header(url: &Url) -> String {
 /// for `mmsc.ktfwing.com`).  The system resolver is the fallback, and every
 /// candidate address is tried in turn rather than just the first one.
 async fn resolve(host: &str, port: u16, opts: &HttpOptions) -> Result<Vec<SocketAddr>> {
+    // An IPv6 literal reaches us bracketed, the way it appears in the URL.
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
@@ -267,10 +285,14 @@ async fn read_response(
     let mut buf = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
 
-    // Headers.
-    let header_end = loop {
-        if let Some(pos) = find(&buf, b"\r\n\r\n") {
-            break pos;
+    // Headers.  Some MMSCs terminate lines with a bare LF, so both forms are
+    // accepted and whichever comes first wins.
+    let (header_end, body_start) = loop {
+        match (find(&buf, b"\r\n\r\n"), find(&buf, b"\n\n")) {
+            (Some(crlf), Some(lf)) if lf < crlf => break (lf, lf + 2),
+            (Some(crlf), _) => break (crlf, crlf + 4),
+            (None, Some(lf)) => break (lf, lf + 2),
+            (None, None) => {}
         }
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
@@ -283,7 +305,7 @@ async fn read_response(
     };
 
     let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-    let mut lines = head.split("\r\n");
+    let mut lines = head.split('\n').map(|l| l.trim_end_matches('\r'));
     let status_line = lines.next().unwrap_or_default();
     let status: u16 = status_line
         .split_whitespace()
@@ -295,7 +317,7 @@ async fn read_response(
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .collect();
 
-    let mut body = buf[header_end + 4..].to_vec();
+    let mut body = buf[body_start..].to_vec();
     let get = |name: &str| {
         headers
             .iter()
@@ -324,7 +346,12 @@ async fn read_response(
         while body.len() < len {
             let n = stream.read(&mut chunk).await?;
             if n == 0 {
-                break;
+                // A short body decoded as if complete would be stored as a
+                // valid but mangled MMS, so refuse it instead.
+                bail!(
+                    "connection closed after {} of {len} announced body bytes",
+                    body.len()
+                );
             }
             body.extend_from_slice(&chunk[..n]);
         }
@@ -345,24 +372,34 @@ async fn read_response(
     Ok(HttpResponse { status, headers, body })
 }
 
+/// De-chunk a body.  Every length here comes from the MMSC, which is reached
+/// through a URL an inbound SMS chose, so nothing may be trusted to be
+/// consistent with the number of bytes actually received.
 fn dechunk(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len());
     let mut pos = 0;
-    loop {
+    while pos < data.len() {
         let Some(eol) = find(&data[pos..], b"\r\n") else { break };
         let size_str = String::from_utf8_lossy(&data[pos..pos + eol]);
         let size_str = size_str.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_str, 16).unwrap_or(0);
+        let Ok(size) = usize::from_str_radix(size_str, 16) else { break };
         pos += eol + 2;
         if size == 0 {
             break;
         }
-        if pos + size > data.len() {
-            out.extend_from_slice(&data[pos..]);
-            break;
+        match pos.checked_add(size).filter(|end| *end <= data.len()) {
+            Some(end) => {
+                out.extend_from_slice(&data[pos..end]);
+                // Step over the chunk's own CRLF, which a connection that
+                // dropped mid-chunk never sent.
+                pos = end.saturating_add(2);
+            }
+            // Truncated final chunk: keep what did arrive.
+            None => {
+                out.extend_from_slice(&data[pos..]);
+                break;
+            }
         }
-        out.extend_from_slice(&data[pos..pos + size]);
-        pos += size + 2;
     }
     Ok(out)
 }
@@ -372,4 +409,51 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dechunk_handles_a_complete_body() {
+        assert_eq!(dechunk(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n").unwrap(), b"Wikipedia");
+        assert_eq!(dechunk(b"4;ext=1\r\nWiki\r\n0\r\n\r\n").unwrap(), b"Wiki");
+    }
+
+    /// A peer that drops the connection mid-chunk used to walk `pos` past the
+    /// end of the buffer and panic on the next iteration.
+    #[test]
+    fn dechunk_survives_a_truncated_body() {
+        assert_eq!(dechunk(b"4\r\nAAAA").unwrap(), b"AAAA");
+        assert_eq!(dechunk(b"8\r\nAAAA").unwrap(), b"AAAA");
+        assert_eq!(dechunk(b"4\r\n").unwrap(), b"");
+        assert_eq!(dechunk(b"").unwrap(), b"");
+    }
+
+    /// A chunk size of usize::MAX overflowed `pos + size` and produced a
+    /// backwards slice range.
+    #[test]
+    fn dechunk_rejects_an_absurd_chunk_size() {
+        assert_eq!(dechunk(b"ffffffffffffffff\r\nAAAA").unwrap(), b"AAAA");
+        assert_eq!(dechunk(b"zz\r\nAAAA").unwrap(), b"");
+    }
+
+    #[test]
+    fn urls_keep_their_query_and_ipv6_literals() {
+        let u = parse_url("http://mmsc.example?id=42").unwrap();
+        assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("mmsc.example", 80, "/?id=42"));
+
+        let u = parse_url("http://mmsc.example:9082/oma_uni?x=1").unwrap();
+        assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("mmsc.example", 9082, "/oma_uni?x=1"));
+
+        let u = parse_url("http://[fd00::1]:8080/x").unwrap();
+        assert_eq!((u.host.as_str(), u.port, u.path.as_str()), ("[fd00::1]", 8080, "/x"));
+
+        let u = parse_url("http://[fd00::1]/x").unwrap();
+        assert_eq!((u.host.as_str(), u.port), ("[fd00::1]", 80));
+
+        assert!(parse_url("https://mmsc.example/x").is_err());
+        assert!(parse_url("http:///x").is_err());
+    }
 }

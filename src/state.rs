@@ -32,11 +32,20 @@ impl Shared {
     }
 
     pub async fn set_modem(&self, handle: Option<Arc<ModemHandle>>) {
-        self.modem_ready.store(handle.is_some(), Ordering::Relaxed);
+        let up = handle.is_some();
+        // Going down, the flag has to lead so nothing new is accepted while
+        // the handle is being dropped; coming up it has to trail, or the SIP
+        // fast path lets a request through to a modem that is not stored yet.
+        if !up {
+            self.modem_ready.store(false, Ordering::Relaxed);
+        }
         // MMS binds its HTTP traffic to the modem's data bearer, so it needs
         // the same handle.
         self.mms.set_modem(handle.clone()).await;
         *self.modem.write().await = handle;
+        if up {
+            self.modem_ready.store(true, Ordering::Relaxed);
+        }
     }
 
     pub async fn modem(&self) -> Option<Arc<ModemHandle>> {

@@ -58,7 +58,14 @@ impl Uri {
             None => (None, None),
         };
 
-        let (host, port) = split_host_port(hostport);
+        // "tel:+821012345678" has no host part at all - the whole thing is
+        // the number, which is what every caller of `user` is after.
+        let (user, host, port) = if scheme == "tel" {
+            (Some(hostport.trim().to_string()), String::new(), None)
+        } else {
+            let (host, port) = split_host_port(hostport);
+            (user, host, port)
+        };
 
         let mut params = Vec::new();
         if let Some(ps) = params_str {
@@ -131,7 +138,11 @@ impl fmt::Display for Uri {
             if let Some(p) = &self.password {
                 write!(f, ":{p}")?;
             }
-            write!(f, "@")?;
+            // A tel: URI is all user and no host, so there is nothing for the
+            // separator to separate.
+            if !self.host.is_empty() {
+                write!(f, "@")?;
+            }
         }
         write!(f, "{}", self.host)?;
         if let Some(p) = self.port {
@@ -218,9 +229,13 @@ impl NameAddr {
     }
 
     pub fn with_tag(mut self, tag: &str) -> Self {
-        self.params.retain(|(k, _)| !k.eq_ignore_ascii_case("tag"));
-        self.params.push(("tag".into(), tag.to_string()));
+        self.set_param("tag", Some(tag));
         self
+    }
+
+    pub fn set_param(&mut self, name: &str, value: Option<&str>) {
+        self.params.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+        self.params.push((name.to_ascii_lowercase(), value.unwrap_or_default().to_string()));
     }
 }
 
@@ -281,5 +296,48 @@ mod tests {
         let n = NameAddr::parse("sip:bob@biloxi.com;tag=xyz").unwrap();
         assert_eq!(n.uri.user.as_deref(), Some("bob"));
         assert_eq!(n.tag(), Some("xyz"));
+    }
+
+    /// A tel: URI is all number and no host; leaving it in `host` made every
+    /// call and SMS from a PBX that uses them fail with 484.
+    #[test]
+    fn tel_uris_carry_the_number_in_the_user_part() {
+        let u = Uri::parse("tel:+821012345678").unwrap();
+        assert_eq!(u.user.as_deref(), Some("+821012345678"));
+        assert_eq!(u.scheme, "tel");
+        let u = Uri::parse("tel:0212345678;phone-context=+82").unwrap();
+        assert_eq!(u.user.as_deref(), Some("0212345678"));
+        assert_eq!(u.param("phone-context"), Some("+82"));
+
+        // It has to survive being written back out: the digest `uri` check
+        // and the dialog headers both compare re-serialised URIs.
+        let u = Uri::parse("tel:+821012345678").unwrap();
+        assert_eq!(u.to_string(), "tel:+821012345678");
+        assert_eq!(Uri::parse(&u.to_string()), Some(u));
+    }
+
+    /// The sip: path must be untouched by the tel: handling above.
+    #[test]
+    fn sip_uris_still_round_trip() {
+        for text in [
+            "sip:alice@atlanta.com",
+            "sip:alice@atlanta.com:5062",
+            "sip:alice@atlanta.com;transport=udp",
+            "sips:bob@biloxi.com:5061",
+            "sip:atlanta.com",
+        ] {
+            let u = Uri::parse(text).expect(text);
+            assert_eq!(u.to_string(), text);
+            assert_eq!(Uri::parse(&u.to_string()).as_ref(), Some(&u));
+        }
+    }
+
+    /// Replacing a parameter must not leave the old copy behind.
+    #[test]
+    fn setting_a_parameter_replaces_it() {
+        let mut n = NameAddr::parse("<sip:a@h>;expires=120").unwrap();
+        n.set_param("expires", Some("118"));
+        assert_eq!(n.to_string(), "<sip:a@h>;expires=118");
+        assert_eq!(n.params.len(), 1);
     }
 }

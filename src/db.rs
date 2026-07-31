@@ -129,6 +129,14 @@ CREATE TABLE IF NOT EXISTS attachments (
     path         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_msg ON attachments(message_id);
+-- Retrying a retrieval used to insert a second copy of every part, so a
+-- database written by an older build can hold duplicates.  They have to go
+-- before the index below can exist; the newest row of each pair wins.
+DELETE FROM attachments WHERE id NOT IN (
+    SELECT MAX(id) FROM attachments GROUP BY message_id, idx
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attachments_msg_idx
+    ON attachments(message_id, idx);
 
 CREATE TABLE IF NOT EXISTS calls (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -254,15 +262,51 @@ impl Db {
         };
         let a = att.clone();
         self.with_conn(move |conn| {
+            // A retried retrieval re-stores the same parts, so an index that
+            // is already there is replaced rather than duplicated.
             conn.execute(
                 "INSERT INTO attachments (message_id, idx, content_type, name, content_id, size, path)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(message_id, idx) DO UPDATE SET
+                     content_type = excluded.content_type,
+                     name         = excluded.name,
+                     content_id   = excluded.content_id,
+                     size         = excluded.size,
+                     path         = excluded.path",
                 params![message_id, a.index, a.content_type, a.name, a.content_id, a.size, a.path],
             )?;
             Ok(())
         })
         .await?;
         Ok(att)
+    }
+
+    /// Drop attachments numbered above `keep`.
+    ///
+    /// A retried retrieval overwrites each part in place, so the only rows
+    /// that need removing afterwards are the tail of a previous, longer run.
+    /// Doing it this way round means a retry that is interrupted leaves the
+    /// message with the parts it already had rather than with none.
+    pub async fn prune_attachments(&self, message_id: i64, keep: i64) -> Result<()> {
+        let stale: Vec<String> = self
+            .with_conn(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT path FROM attachments WHERE message_id = ?1 AND idx > ?2",
+                )?;
+                let rows = stmt
+                    .query_map(params![message_id, keep], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                conn.execute(
+                    "DELETE FROM attachments WHERE message_id = ?1 AND idx > ?2",
+                    params![message_id, keep],
+                )?;
+                Ok(rows)
+            })
+            .await?;
+        for path in stale {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+        Ok(())
     }
 
     /// Fill in the fields that only become known once an MMS body has been

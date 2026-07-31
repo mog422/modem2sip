@@ -20,6 +20,7 @@ mod vendor;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -120,15 +121,28 @@ async fn main() -> Result<()> {
             }
         }
     }));
-    tasks.push(tokio::spawn({
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let gateway = tokio::spawn({
         let shared = shared.clone();
         let core = core.clone();
-        async move { gateway::run(shared, core, sip_rx, modem_rx).await }
-    }));
+        async move { gateway::run(shared, core, sip_rx, modem_rx, shutdown_rx).await }
+    });
 
     info!("modem2sip is running; SIP answers 503 until the modem is ready");
     shutdown_signal().await;
     warn!("shutting down");
+
+    // Let the gateway hang up whatever is in progress before anything else
+    // goes away; a call abandoned here stays connected on the network.
+    // It only sees the signal between events, so a handler that is blocked on
+    // a wedged D-Bus call will miss the deadline - say so, because the mobile
+    // leg is then still up when the process exits.
+    let _ = shutdown_tx.send(());
+    let abort = gateway.abort_handle();
+    if tokio::time::timeout(Duration::from_secs(5), gateway).await.is_err() {
+        warn!("the gateway did not finish in time; a call in progress may still be connected");
+        abort.abort();
+    }
     for t in tasks {
         t.abort();
     }

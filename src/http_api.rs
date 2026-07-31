@@ -16,6 +16,9 @@ use tracing::{debug, info, warn};
 use crate::mms::SendRequest;
 use crate::state::Shared;
 
+/// Floor for the whole-request deadline; MMS endpoints push it out further.
+const MIN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub async fn run(shared: Arc<Shared>) -> Result<()> {
     if !shared.cfg.http.enabled {
         info!("HTTP API disabled");
@@ -39,9 +42,18 @@ pub async fn run(shared: Arc<Shared>) -> Result<()> {
             }
         };
         let shared = shared.clone();
+        // A client that connects and then says nothing would otherwise park a
+        // task on read() forever, and there is no cap on how many.  The
+        // deadline has to clear the MMS budget: cancelling a submission
+        // half-way leaves the row saying "sending" while the MMSC already has
+        // the message.
+        let deadline = MIN_REQUEST_TIMEOUT
+            .max(std::time::Duration::from_secs(shared.cfg.mms.timeout_secs * 2 + 30));
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, shared).await {
-                debug!(%peer, error = %e, "HTTP connection failed");
+            match tokio::time::timeout(deadline, handle(stream, shared)).await {
+                Ok(Err(e)) => debug!(%peer, error = %format!("{e:#}"), "HTTP connection failed"),
+                Err(_) => debug!(%peer, "HTTP request timed out"),
+                Ok(Ok(())) => {}
             }
         });
     }
@@ -74,6 +86,12 @@ fn percent_decode(s: &str) -> String {
     percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned()
 }
 
+/// Compare without leaking how much of the token matched through timing.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
     let req = match read_request(&mut stream).await? {
         Some(r) => r,
@@ -81,11 +99,12 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
     };
 
     if let Some(token) = &shared.cfg.http.token {
-        let ok = req
+        let presented = req
             .header("authorization")
-            .map(|v| v.trim_start_matches("Bearer ").trim() == token)
-            .unwrap_or(false);
-        if !ok {
+            .and_then(|v| v.trim().strip_prefix("Bearer "))
+            .map(str::trim)
+            .unwrap_or("");
+        if !constant_time_eq(presented, token) {
             return respond_json(&mut stream, 401, &json!({"error": "unauthorized"})).await;
         }
     }
@@ -145,14 +164,27 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                 .unwrap_or(50)
                 .clamp(1, 500);
             let before = req.query_param("before").and_then(|v| v.parse::<i64>().ok());
-            let messages = shared.db.list_messages(limit, before).await?;
-            respond_json(&mut stream, 200, &json!({ "messages": messages })).await
+            // A `?` here would drop the connection without a status line and
+            // leave the client staring at an empty reply.
+            match shared.db.list_messages(limit, before).await {
+                Ok(messages) => {
+                    respond_json(&mut stream, 200, &json!({ "messages": messages })).await
+                }
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "listing messages failed");
+                    respond_json(&mut stream, 500, &json!({"error": "database error"})).await
+                }
+            }
         }
 
         ("GET", ["messages", id]) => match id.parse::<i64>() {
-            Ok(id) => match shared.db.get_message(id).await? {
-                Some(m) => respond_json(&mut stream, 200, &json!(m)).await,
-                None => respond_json(&mut stream, 404, &json!({"error": "not found"})).await,
+            Ok(id) => match shared.db.get_message(id).await {
+                Ok(Some(m)) => respond_json(&mut stream, 200, &json!(m)).await,
+                Ok(None) => respond_json(&mut stream, 404, &json!({"error": "not found"})).await,
+                Err(e) => {
+                    warn!(id, error = %format!("{e:#}"), "reading the message failed");
+                    respond_json(&mut stream, 500, &json!({"error": "database error"})).await
+                }
             },
             Err(_) => respond_json(&mut stream, 400, &json!({"error": "bad id"})).await,
         },
@@ -161,11 +193,34 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
             let (Ok(id), Ok(index)) = (id.parse::<i64>(), index.parse::<i64>()) else {
                 return respond_json(&mut stream, 400, &json!({"error": "bad id"})).await;
             };
-            match shared.db.attachment_path(id, index).await? {
+            let found = match shared.db.attachment_path(id, index).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(id, index, error = %format!("{e:#}"), "looking up the attachment failed");
+                    return respond_json(&mut stream, 500, &json!({"error": "database error"}))
+                        .await;
+                }
+            };
+            match found {
                 Some((path, content_type)) => match tokio::fs::read(&path).await {
-                    Ok(data) => respond_bytes(&mut stream, 200, &content_type, data).await,
+                    // The bytes and the declared type both come from whoever
+                    // sent the MMS, so the browser is told not to sniff and
+                    // not to render it inline.
+                    Ok(data) => {
+                        respond_bytes_with(
+                            &mut stream,
+                            200,
+                            &content_type,
+                            "X-Content-Type-Options: nosniff\r\n\
+                             Content-Disposition: attachment\r\n",
+                            data,
+                        )
+                        .await
+                    }
                     Err(e) => {
-                        respond_json(&mut stream, 500, &json!({"error": e.to_string()})).await
+                        warn!(?path, error = %e, "cannot read the stored attachment");
+                        respond_json(&mut stream, 500, &json!({"error": "attachment unreadable"}))
+                            .await
                     }
                 },
                 None => respond_json(&mut stream, 404, &json!({"error": "not found"})).await,
@@ -221,7 +276,7 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
             };
             match shared.mms.retrieve_stored(id).await {
                 Ok(()) => {
-                    let msg = shared.db.get_message(id).await?;
+                    let msg = shared.db.get_message(id).await.ok().flatten();
                     respond_json(&mut stream, 200, &json!({"status": "retrieved", "message": msg}))
                         .await
                 }
@@ -320,6 +375,16 @@ async fn respond_bytes(
     content_type: &str,
     body: Vec<u8>,
 ) -> Result<()> {
+    respond_bytes_with(stream, status, content_type, "", body).await
+}
+
+async fn respond_bytes_with(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    extra_headers: &str,
+    body: Vec<u8>,
+) -> Result<()> {
     let reason = match status {
         200 => "OK",
         202 => "Accepted",
@@ -327,15 +392,85 @@ async fn respond_bytes(
         401 => "Unauthorized",
         404 => "Not Found",
         500 => "Internal Server Error",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Status",
     };
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        sanitize_media_type(content_type),
         body.len()
     );
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(&body).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Make a media type safe to interpolate into a response head.
+///
+/// An MMS part names its own Content-Type as a free-form string decoded
+/// straight from the PDU, so it can contain CRLF and split the response into
+/// headers and a body of the sender's choosing.  Only the characters a media
+/// type is allowed to use survive.
+fn sanitize_media_type(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .take_while(|c| *c != '\r' && *c != '\n')
+        .filter(|c| c.is_ascii_alphanumeric() || "/.+-_;= ".contains(*c))
+        .take(128)
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() || !cleaned.contains('/') {
+        return "application/octet-stream".into();
+    }
+    cleaned.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Content-Type of an MMS part is decoded from the PDU as a
+    /// free-form string, so it must never be able to close the header and
+    /// write a response body of the sender's choosing.
+    #[test]
+    fn a_media_type_cannot_break_out_of_the_header() {
+        assert_eq!(
+            sanitize_media_type("image/jpeg\r\nX-Evil: 1\r\n\r\n<script>"),
+            "image/jpeg"
+        );
+        assert_eq!(sanitize_media_type("text/plain\nSet-Cookie: a=b"), "text/plain");
+        for out in [
+            sanitize_media_type(""),
+            sanitize_media_type("\r\n"),
+            sanitize_media_type("notamediatype"),
+            sanitize_media_type("\u{202e}evil"),
+        ] {
+            assert_eq!(out, "application/octet-stream");
+        }
+    }
+
+    /// Ordinary types have to survive intact, parameters included.
+    #[test]
+    fn a_normal_media_type_is_left_alone() {
+        for ct in [
+            "image/jpeg",
+            "text/plain; charset=utf-8",
+            "application/vnd.wap.mms-message",
+            "application/json; charset=utf-8",
+        ] {
+            assert_eq!(sanitize_media_type(ct), ct);
+        }
+        // Absurdly long values are cut rather than echoed in full.
+        assert!(sanitize_media_type(&format!("image/{}", "a".repeat(500))).len() <= 128);
+    }
+
+    #[test]
+    fn token_comparison_needs_an_exact_match() {
+        assert!(constant_time_eq("s3cret", "s3cret"));
+        assert!(!constant_time_eq("s3cret", "s3cre"));
+        assert!(!constant_time_eq("", "s3cret"));
+        assert!(!constant_time_eq("s3cretX", "s3cret"));
+    }
 }

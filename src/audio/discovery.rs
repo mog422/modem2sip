@@ -188,19 +188,23 @@ fn is_under(path: &Path, ancestor: &Path) -> bool {
 }
 
 /// For `/sys/devices/.../usb1/1-3/1-3:1.2` return `/sys/devices/.../usb1/1-3`.
+///
+/// The walk stops at the *first* (deepest) device it meets.  Continuing to
+/// the top would return the hub two identical modems are plugged into, and
+/// then both of their cards look like candidates for both of them - exactly
+/// the mix-up this whole matching scheme exists to prevent.
 fn usb_device_root(path: &Path) -> Option<PathBuf> {
     let mut current = Some(path);
-    let mut best: Option<PathBuf> = None;
     while let Some(p) = current {
         if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
             // USB interfaces look like "1-3:1.2", devices like "1-3" or "1-3.4".
             if !name.contains(':') && name.contains('-') && name.starts_with(|c: char| c.is_ascii_digit()) {
-                best = Some(p.to_path_buf());
+                return Some(p.to_path_buf());
             }
         }
         current = p.parent();
     }
-    best
+    None
 }
 
 #[cfg(test)]
@@ -214,5 +218,17 @@ mod tests {
             usb_device_root(&p).unwrap(),
             PathBuf::from("/sys/devices/pci0000:00/0000:00:14.0/usb1/1-3")
         );
+    }
+
+    /// Two identical modems on one hub must not share a root, or each one
+    /// sees the other's sound card as a candidate.
+    #[test]
+    fn devices_behind_a_hub_stay_distinct() {
+        let base = "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-3";
+        let a = PathBuf::from(format!("{base}/1-3.1/1-3.1:1.2/sound/card1"));
+        let b = PathBuf::from(format!("{base}/1-3.2/1-3.2:1.2/sound/card2"));
+        assert_eq!(usb_device_root(&a).unwrap(), PathBuf::from(format!("{base}/1-3.1")));
+        assert_eq!(usb_device_root(&b).unwrap(), PathBuf::from(format!("{base}/1-3.2")));
+        assert_ne!(usb_device_root(&a), usb_device_root(&b));
     }
 }

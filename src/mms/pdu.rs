@@ -187,8 +187,8 @@ pub fn decode(data: &[u8]) -> Result<MmsMessage> {
             field::TRANSACTION_ID => msg.transaction_id = r.text_string(),
             field::MMS_VERSION => msg.version = r.u8(),
             field::FROM => {
-                let len = r.value_length().unwrap_or(0);
-                let end = (r.pos + len).min(r.data.len());
+                let len = r.bounded_value_length().unwrap_or(0);
+                let end = r.pos + len;
                 let mut inner = Reader::new(&r.data[r.pos..end]);
                 r.pos = end;
                 match inner.u8() {
@@ -231,12 +231,14 @@ pub fn decode(data: &[u8]) -> Result<MmsMessage> {
                 }
             }
             field::EXPIRY => {
-                let len = r.value_length().unwrap_or(0);
-                let end = (r.pos + len).min(r.data.len());
+                let len = r.bounded_value_length().unwrap_or(0);
+                let end = r.pos + len;
                 let mut inner = Reader::new(&r.data[r.pos..end]);
                 r.pos = end;
                 let _token = inner.u8();
-                msg.expiry = inner.long_int();
+                // Delta-seconds is an Integer-value, so anything up to 127
+                // arrives as a short integer rather than a long one.
+                msg.expiry = inner.integer_value();
             }
             // Kept as the raw well-known value: 0x80 is "Ok" for both.
             field::RESPONSE_STATUS => msg.response_status = r.u8(),
@@ -289,10 +291,10 @@ fn decode_multipart(body: &[u8]) -> Vec<MmsPart> {
     let Some(count) = r.uintvar() else { return Vec::new() };
     let mut parts = Vec::new();
     for _ in 0..count.min(256) {
-        let Some(headers_len) = r.uintvar() else { break };
-        let Some(data_len) = r.uintvar() else { break };
-        let Some(header_bytes) = r.take(headers_len as usize) else { break };
-        let Some(data) = r.take(data_len as usize) else { break };
+        let Some(headers_len) = r.uintvar().and_then(|v| usize::try_from(v).ok()) else { break };
+        let Some(data_len) = r.uintvar().and_then(|v| usize::try_from(v).ok()) else { break };
+        let Some(header_bytes) = r.take(headers_len) else { break };
+        let Some(data) = r.take(data_len) else { break };
 
         let mut hr = Reader::new(header_bytes);
         let (content_type, params) =

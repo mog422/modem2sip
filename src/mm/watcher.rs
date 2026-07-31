@@ -417,10 +417,15 @@ async fn supervise(
         Err(e) => return format!("cannot watch Messaging.Added: {e}"),
     };
 
+    let mut call_tasks: HashMap<String, JoinHandle<()>> = HashMap::new();
+
     // Adopt whatever already exists: calls that survived a restart and
-    // messages stored on the SIM/modem.
+    // messages stored on the SIM/modem.  An adopted call needs the same
+    // state subscription as one that arrives by signal, or its hangup is
+    // never noticed and the SIP leg hangs on dead air.
     if let Ok(calls) = handle.list_calls().await {
         for c in calls {
+            spawn_call_watch(&handle, &c, tx, &mut call_tasks).await;
             let _ = tx.send(ModemEvent::CallAdded(c)).await;
         }
     }
@@ -430,7 +435,6 @@ async fn supervise(
         }
     }
 
-    let mut call_tasks: HashMap<String, JoinHandle<()>> = HashMap::new();
     let mut health = tokio::time::interval(Duration::from_secs(10));
     health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     health.tick().await; // fires immediately
@@ -570,5 +574,9 @@ async fn spawn_call_watch(
             }
         }
     });
-    tasks.insert(key, task);
+    // ModemManager reuses call object paths, so a stale watcher for the same
+    // path has to go rather than being silently leaked.
+    if let Some(previous) = tasks.insert(key, task) {
+        previous.abort();
+    }
 }

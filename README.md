@@ -267,7 +267,31 @@ Tested against KT (`http://mmsc.ktfwing.com:9082`):
 
 Set `http.token` to require `Authorization: Bearer <token>`. The API binds to
 localhost by default; it has no TLS, so put it behind a proxy if you expose
-it.
+it. Attachments are served with `nosniff` and `Content-Disposition:
+attachment`, because both the bytes and the declared media type come from
+whoever sent the MMS.
+
+## Exposure
+
+Nothing here is safe to put on an untrusted network as it stands: SIP is
+plaintext UDP and the HTTP API has no TLS. What the gateway does enforce:
+
+* `sip.auth` challenges inbound `INVITE`/`MESSAGE`/`REGISTER` with digest.
+  Each nonce is accepted once (or once per `nc` value with `qop=auth`), and
+  the realm and Request-URI are checked, so a captured `Authorization` header
+  cannot be replayed onto a different request.
+* In-dialog `BYE` and `INFO` are matched on the Call-ID **and** both dialog
+  tags, so knowing the Call-ID is not enough to hang up a call or inject
+  digits into it.
+* RTP is only accepted from the address signalled in SDP. Symmetric RTP still
+  latches onto whatever port the peer sends from, which is what makes it work
+  behind NAT, but not onto a different host.
+* `sip.allow` restricts which source addresses are answered at all.
+
+With `sip.auth` unset and `sip.allow` empty — the defaults — anyone who can
+reach the SIP port can place calls and send messages, and one unauthenticated
+`REGISTER` is enough to become the target inbound calls and SMS are delivered
+to. Set at least one of the two on any interface you do not fully control.
 
 ## Behaviour when the modem is missing
 
@@ -333,11 +357,15 @@ USB sound card (`plughw:EP06E,0`, S16_LE mono 8 kHz), live KT SIM.
 | Registrar, ACL, digest, dialog checks | `REGISTER` 200, out-of-dialog `INFO` → 481 |
 | Built-in Quectel voice-path setup | `AT+QPCMV=1,2` sent on ready, skipped when already on, audio avg 3241 |
 | Digest-authenticated softphone on another subnet | `REGISTER` 200, `INVITE` → audio (493 packets, avg 3210), inbound SMS delivered as `MESSAGE` |
-| `cargo test` | 24 passed |
+| `cargo test` | 56 passed |
 
 Not verifiable from this host: an **inbound** call (needs an external caller)
 and MMS **receive** (needs a real WAP push plus carrier MMSC settings); both
 paths are exercised only by unit tests and code review.
+
+The hardware rows above were measured before the transaction-layer, teardown
+and RTP-acceptance rework; only the test suite has been re-run since. Worth
+repeating on a modem before trusting them again.
 
 ## Limitations
 
@@ -346,7 +374,9 @@ paths are exercised only by unit tests and code review.
   path, so AMR/AMR-WB compression sits between them and the far end's
   detector. It is what analogue gateways have always done, but it is not as
   reliable as signalled DTMF.
-* SIP over UDP only; no TLS/SRTP, no video, no call hold/transfer.
+* SIP over UDP only; no TLS/SRTP and no video. A re-INVITE is answered and
+  the media endpoint follows it, so hold/resume should survive, but neither
+  that nor transfer has been tried against a real PBX.
 * G.711 only. Wide-band modem cards are resampled to 8 kHz.
 * One concurrent call per modem.
 * MMS over HTTPS MMSC URLs is not supported (plain HTTP only, which is what

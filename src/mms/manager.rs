@@ -175,15 +175,19 @@ impl MmsManager {
             return Ok(Some(id));
         }
         if !self.cfg.mms.auto_retrieve {
+            // Deferred: the body stays on the MMSC until it is fetched
+            // through the HTTP API.
+            self.notify_resp(&notification, 0x83).await;
             return Ok(Some(id));
         }
 
-        match self.retrieve(&notification, id).await {
-            Ok(()) => {}
-            Err(e) => {
-                warn!(id, error = %format!("{e:#}"), "MMS retrieval failed");
-                self.db.set_status(id, "retrieve_failed", Some(&e.to_string())).await?;
-            }
+        if let Err(e) = self.retrieve(&notification, id).await {
+            // Deliberately unanswered: "deferred" would tell the MMSC we
+            // intend to fetch it ourselves and stop it re-notifying, and
+            // nothing here retries automatically.  Staying quiet keeps the
+            // carrier's own retry going.
+            warn!(id, error = %format!("{e:#}"), "MMS retrieval failed; leaving it to the carrier to re-notify");
+            self.db.set_status(id, "retrieve_failed", Some(&e.to_string())).await?;
         }
         Ok(Some(id))
     }
@@ -229,6 +233,32 @@ impl MmsManager {
         }
 
         let message = pdu::decode(&resp.body).context("decoding M-Retrieve.conf")?;
+
+        // A 200 with an error page or an unsupported-content status decodes
+        // into an empty message.  Storing that as "received" and then
+        // acknowledging it makes the MMSC drop the real message for good, so
+        // both are checked before anything is written.
+        if message.message_type != pdu::msg_type::RETRIEVE_CONF {
+            // Not every MMSC labels its reply, so the absence of the header
+            // alone is not fatal - but a captive portal or error page decodes
+            // to no parts at all, and that is what has to be caught.
+            if message.parts.is_empty() {
+                bail!(
+                    "the MMSC returned a {} with no content instead of an M-Retrieve.conf",
+                    pdu::msg_type::name(message.message_type)
+                );
+            }
+            warn!(
+                kind = pdu::msg_type::name(message.message_type),
+                parts = message.parts.len(),
+                "the MMSC did not label its reply as an M-Retrieve.conf; storing it anyway"
+            );
+        }
+        if let Some(status) = message.retrieve_status.filter(|s| *s != 0x80) {
+            let text = message.response_text.clone().unwrap_or_default();
+            bail!("the MMSC refused the retrieval: status 0x{status:02x} {text}");
+        }
+
         self.store_retrieved(id, &message).await?;
 
         // Tell the MMSC we got it.  Failure here is not fatal.
@@ -244,6 +274,24 @@ impl MmsManager {
         Ok(())
     }
 
+    /// Answer a notification we are not going to retrieve right now.
+    ///
+    /// Silence makes the carrier re-notify on a timer and then expire the
+    /// message; telling it what happened stops both.
+    ///
+    /// status: 0x80 expired, 0x81 retrieved, 0x82 rejected, 0x83 deferred,
+    /// 0x84 unrecognised.
+    async fn notify_resp(&self, notification: &MmsMessage, status: u8) {
+        let Some(tid) = notification.transaction_id.as_deref() else { return };
+        let Some(mmsc) = self.cfg.mms.mmsc.as_deref() else { return };
+        let pdu = pdu::encode_notify_resp_ind(tid, status, false);
+        let opts = self.http_options().await;
+        match http::post(mmsc, "application/vnd.wap.mms-message", pdu, &opts).await {
+            Ok(r) => debug!(status = r.status, notify_status = status, "M-NotifyResp.ind sent"),
+            Err(e) => debug!(error = %format!("{e:#}"), "M-NotifyResp.ind failed"),
+        }
+    }
+
     async fn store_retrieved(&self, id: i64, message: &MmsMessage) -> Result<()> {
         let text = message.body_text();
         let subject = message.subject.clone();
@@ -253,6 +301,8 @@ impl MmsManager {
 
         // Text parts are stored twice on purpose: inline as the message text
         // (that is what SIP peers see) and as a part, so nothing is lost.
+        // Each part overwrites the one with the same index from any earlier
+        // attempt; the tail of a longer previous run is pruned at the end.
         let mut index = 0i64;
         for part in &message.parts {
             if part.content_type.contains("smil") {
@@ -270,6 +320,7 @@ impl MmsManager {
                 )
                 .await?;
         }
+        self.db.prune_attachments(id, index).await?;
         self.db.set_status(id, "received", None).await?;
         info!(id, parts = index, "MMS retrieved and stored");
         Ok(())
@@ -378,8 +429,18 @@ impl MmsManager {
 
         match result {
             Ok(resp) if resp.status == 200 => {
+                // An M-Send.conf that will not decode, or that omits the
+                // status, is not a confirmation - treating it as one records
+                // a message the carrier may never have accepted.
+                // No status at all means the MMSC told us nothing beyond the
+                // 200, so the submission is taken at face value.  An explicit
+                // non-Ok status is a refusal and must not be recorded as
+                // sent.
                 let conf = pdu::decode(&resp.body).ok();
                 let status = conf.as_ref().and_then(|c| c.response_status).unwrap_or(0x80);
+                if conf.is_none() {
+                    warn!(id, "the MMSC replied 200 with a body we cannot decode; assuming sent");
+                }
                 if status == 0x80 {
                     self.db.set_status(id, "sent", None).await?;
                     info!(id, to = %req.to.join(","), "MMS sent");

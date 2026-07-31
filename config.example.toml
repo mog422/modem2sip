@@ -62,7 +62,10 @@ user_agent = "modem2sip/0.1"
 ring_timeout_secs = 60
 options_reflect_modem = true        # OPTIONS answers 503 while the modem is down
 retry_after_secs = 30
-# allow = ["192.168.1.0/24"]        # source ACL, empty = anyone
+# Source ACL, empty = anyone.  With neither this nor [sip.auth] set, any host
+# that can reach this port can place calls, send SMS, and REGISTER itself as
+# the destination for inbound calls and messages.
+# allow = ["192.168.1.0/24"]
 # call_target = "sip:2001@192.168.1.10:5060"   # where inbound calls are sent
 # sms_target  = "sip:2001@192.168.1.10:5060"   # defaults to call_target
 # from_user   = "modem1"

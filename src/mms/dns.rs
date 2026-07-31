@@ -104,15 +104,75 @@ impl Resolver {
             }
         }
 
+        // Connect the socket so the kernel drops datagrams from anyone but
+        // the resolver we asked.  Without it any host that can reach the
+        // bearer address could race in a forged A record and point MMS
+        // retrieval - and outgoing message bodies - at itself.
+        sock.connect(SocketAddr::new(server, 53)).await?;
+
         let id: u16 = rand::thread_rng().gen();
         let query = build_query(id, host, qtype)?;
-        sock.send_to(&query, SocketAddr::new(server, 53)).await?;
+        sock.send(&query).await?;
 
-        let mut buf = vec![0u8; 1500];
-        let len = tokio::time::timeout(self.timeout, sock.recv(&mut buf))
-            .await
-            .map_err(|_| anyhow!("{server} did not answer in {:?}", self.timeout))??;
-        parse_answer(&buf[..len], id, qtype)
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                bail!("{server} did not answer in {:?}", self.timeout);
+            }
+            let len = match tokio::time::timeout(remaining, sock.recv(&mut buf)).await {
+                Ok(r) => r?,
+                Err(_) => bail!("{server} did not answer in {:?}", self.timeout),
+            };
+            // Source filtering still leaves an on-path attacker, and a late
+            // reply to an earlier query looks just like a fresh one, so the
+            // transaction id and the echoed question both have to match.
+            match classify(&buf[..len], id, host, qtype) {
+                Reply::Ours => return parse_answer(&buf[..len], id, qtype),
+                // A resolver that refuses or cannot parse the query answers
+                // without echoing the question.  Waiting the rest of the
+                // timeout out would only delay the fallback.
+                Reply::Rejected(rcode) => bail!("{server} answered rcode {rcode}"),
+                Reply::NotOurs => {
+                    debug!(%server, host, "ignoring a DNS datagram that does not answer our question");
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Reply {
+    /// Answers the exact question we asked.
+    Ours,
+    /// Carries our transaction id but no echoed question - what a resolver
+    /// sends when it refuses or cannot parse the query.
+    Rejected(u16),
+    /// For somebody else, or forged.
+    NotOurs,
+}
+
+/// Does this datagram answer the exact question we asked?
+fn classify(msg: &[u8], want_id: u16, host: &str, qtype: u16) -> Reply {
+    if msg.len() < 12 || u16::from_be_bytes([msg[0], msg[1]]) != want_id {
+        return Reply::NotOurs;
+    }
+    let flags = u16::from_be_bytes([msg[2], msg[3]]);
+    if flags & 0x8000 == 0 {
+        return Reply::NotOurs;
+    }
+    let echoed = u16::from_be_bytes([msg[4], msg[5]]) == 1
+        && matches!((read_name(msg, 12), skip_name(msg, 12)), (Ok(name), Ok(after))
+            if msg.get(after..after + 4).is_some_and(|q| {
+                u16::from_be_bytes([q[0], q[1]]) == qtype
+                    && u16::from_be_bytes([q[2], q[3]]) == 1
+                    && name.eq_ignore_ascii_case(host.trim_end_matches('.'))
+            }));
+    match (echoed, flags & 0x000F) {
+        (true, _) => Reply::Ours,
+        (false, 0) => Reply::NotOurs,
+        (false, rcode) => Reply::Rejected(rcode),
     }
 }
 
@@ -203,6 +263,11 @@ fn parse_answer(msg: &[u8], want_id: u16, qtype: u16) -> Result<Answer> {
         0 => {}
         3 => bail!("NXDOMAIN"),
         rcode => bail!("DNS rcode {rcode}"),
+    }
+    if flags & 0x0200 != 0 {
+        // No TCP fallback here; whatever records did fit are still usable and
+        // an MMSC name has never needed more than one datagram in practice.
+        debug!("DNS answer is truncated; using the records that arrived");
     }
 
     let qdcount = u16::from_be_bytes([msg[4], msg[5]]);
@@ -306,5 +371,37 @@ mod tests {
 
         msg[3] = 0x83; // NXDOMAIN
         assert!(parse_answer(&msg, 0x0001, TYPE_A).is_err());
+    }
+
+    /// Only a datagram that echoes our own question counts as the answer.
+    #[test]
+    fn only_our_question_is_accepted() {
+        let mut msg = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0];
+        msg.extend_from_slice(&name(&["mmsc", "example"]));
+        msg.extend_from_slice(&[0, 1, 0, 1]); // A IN
+
+        assert_eq!(classify(&msg, 0x1234, "mmsc.example", TYPE_A), Reply::Ours);
+        assert_eq!(classify(&msg, 0x1234, "MMSC.Example.", TYPE_A), Reply::Ours);
+        // Right id, wrong name: a forged answer for something else.
+        assert_eq!(classify(&msg, 0x1234, "other.example", TYPE_A), Reply::NotOurs);
+        // Right name, wrong id or query type.
+        assert_eq!(classify(&msg, 0x9999, "mmsc.example", TYPE_A), Reply::NotOurs);
+        assert_eq!(classify(&msg, 0x1234, "mmsc.example", TYPE_AAAA), Reply::NotOurs);
+        // A query echoed back at us rather than a response.
+        let mut query = msg.clone();
+        query[2] = 0x01;
+        assert_eq!(classify(&query, 0x1234, "mmsc.example", TYPE_A), Reply::NotOurs);
+        assert_eq!(classify(b"short", 0x1234, "mmsc.example", TYPE_A), Reply::NotOurs);
+    }
+
+    /// A resolver that refuses the query answers without echoing it; waiting
+    /// out the timeout for that would only delay the fallback.
+    #[test]
+    fn a_refusal_is_terminal_rather_than_ignored() {
+        // REFUSED, no question section.
+        let refused = vec![0x12, 0x34, 0x81, 0x85, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(classify(&refused, 0x1234, "mmsc.example", TYPE_A), Reply::Rejected(5));
+        // Same shape but for a transaction that is not ours: still ignored.
+        assert_eq!(classify(&refused, 0x9999, "mmsc.example", TYPE_A), Reply::NotOurs);
     }
 }
