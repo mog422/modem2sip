@@ -77,6 +77,8 @@ struct ActiveCall {
 
     answered: bool,
     ringing_sent: bool,
+    /// A 183 with SDP has been sent and the audio path is already up.
+    early_media: bool,
     cdr_id: Option<i64>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -315,6 +317,7 @@ impl Gateway {
             media_dtmf_pt: None,
             answered: false,
             ringing_sent: false,
+            early_media: false,
             cdr_id,
             tasks: Vec::new(),
         };
@@ -348,7 +351,20 @@ impl Gateway {
         match new {
             call_state::RINGING_OUT | call_state::DIALING => {
                 if role == Role::FromSip && !ringing_sent {
-                    self.send_provisional(180).await;
+                    if self.shared.cfg.sip.early_media {
+                        // The network is already sending audio - its ringback
+                        // tone, or an announcement telling the caller why this
+                        // call is not going to connect.  Let them hear it.
+                        if let Err(e) = self.start_early_media().await {
+                            warn!(
+                                error = %format!("{e:#}"),
+                                "early media failed, falling back to 180 Ringing"
+                            );
+                            self.send_provisional(180).await;
+                        }
+                    } else {
+                        self.send_provisional(180).await;
+                    }
                 }
             }
             call_state::ACTIVE => {
@@ -409,14 +425,41 @@ impl Gateway {
 
     /// Send the 200 OK that connects a SIP -> modem call, media first.
     async fn answer_sip_caller(&mut self) -> Result<()> {
+        self.respond_with_media(200).await
+    }
+
+    /// Open the audio path early and tell the caller to play what arrives.
+    ///
+    /// The mobile network starts sending audio while it is alerting - its own
+    /// ringback, or an announcement explaining why the call will not connect -
+    /// and a bare `180 Ringing` would throw that away and have the caller's
+    /// phone generate a local tone instead.
+    async fn start_early_media(&mut self) -> Result<()> {
+        self.respond_with_media(183).await?;
+        if let Some(call) = self.call.as_mut() {
+            call.ringing_sent = true;
+            call.early_media = true;
+        }
+        info!("early media: the caller now hears the network");
+        Ok(())
+    }
+
+    /// Answer the pending INVITE with `code` and an SDP answer, opening the
+    /// media session first if it is not already running.  Used for both the
+    /// early-media `183` and the final `200`, which must describe the same
+    /// transport.
+    async fn respond_with_media(&mut self, code: u16) -> Result<()> {
         let Some((remote_sdp, codec)) =
             self.call.as_ref().map(|c| (c.remote_sdp.clone(), c.codec))
         else {
             return Ok(());
         };
         let remote_sdp = remote_sdp.ok_or_else(|| anyhow!("no remote SDP"))?;
-        let remote_media = SocketAddr::new(remote_sdp.address, remote_sdp.port);
-        self.start_media(remote_media, codec).await?;
+
+        if self.call.as_ref().and_then(|c| c.media.as_ref()).is_none() {
+            let remote_media = SocketAddr::new(remote_sdp.address, remote_sdp.port);
+            self.start_media(remote_media, codec).await?;
+        }
 
         let dtmf_pt = self.shared.cfg.rtp.dtmf_payload_type;
         let ptime = self.shared.cfg.audio.period_ms;
@@ -425,7 +468,7 @@ impl Gateway {
         let advertised = core.transport.advertised_ip(call.remote_addr);
         let answer = remote_sdp.answer(advertised, call.local_rtp_port, codec, Some(dtmf_pt), ptime);
         let src = call.invite_src.unwrap_or(call.remote_addr);
-        let mut resp = core.make_response(&call.invite, 200, None);
+        let mut resp = core.make_response(&call.invite, code, None);
         resp.headers.set("content-type", "application/sdp");
         resp.headers.set("to", call.local.to_string());
         resp.headers.set("allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, INFO, MESSAGE");
@@ -468,6 +511,22 @@ impl Gateway {
             // `call_id()` is None on a malformed request; comparing straight
             // against it would make that match an idle gateway's `None`.
             if req.headers.call_id() == Some(call.call_id.as_str()) {
+                // Before the call is answered this is a UDP retransmission of
+                // the original INVITE, not a re-INVITE: repeat the last
+                // provisional instead of answering a call the network has not
+                // connected yet.
+                if !call.answered {
+                    let (code, early) = (
+                        if call.early_media { 183 } else { 180 },
+                        call.early_media,
+                    );
+                    debug!(code, "INVITE retransmitted during setup, repeating the provisional");
+                    if early {
+                        return self.respond_with_media(183).await;
+                    }
+                    self.send_provisional(code).await;
+                    return Ok(());
+                }
                 return self.on_sip_reinvite(req, src).await;
             }
             info!("rejecting INVITE: the modem is already on a call");
@@ -561,6 +620,7 @@ impl Gateway {
             media_dtmf_pt: None,
             answered: false,
             ringing_sent: false,
+            early_media: false,
             cdr_id,
             tasks: Vec::new(),
         });
@@ -1769,6 +1829,7 @@ mod tests {
             media_dtmf_pt: None,
             answered: true,
             ringing_sent: true,
+            early_media: false,
             cdr_id: None,
             tasks: Vec::new(),
         }

@@ -59,6 +59,9 @@ bind       = "0.0.0.0:5060"
 # public_ip = "192.0.2.10"          # advertised in Via/Contact/SDP behind NAT
 domain     = "modem2sip.local"
 user_agent = "modem2sip/0.1"
+# Answer alerting with 183 + SDP so the caller hears the network's own
+# ringback and announcements instead of a locally generated tone.
+early_media       = true
 ring_timeout_secs = 60
 options_reflect_modem = true        # OPTIONS answers 503 while the modem is down
 retry_after_secs = 30

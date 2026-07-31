@@ -30,6 +30,8 @@ vendor_audio_setup = "auto"
 [sip]
 bind       = "0.0.0.0:5060"
 domain     = "modem2sip.lan"
+# The caller hears the network's own ringback and announcements.
+early_media = true
 # Without call_target/sms_target, calls and messages go to whichever client
 # is registered.
 # call_target = "sip:2001@192.168.1.10:5060"

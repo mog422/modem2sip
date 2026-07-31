@@ -207,11 +207,25 @@ pub fn goertzel(samples: &[i16], freq: f32, rate: f32) -> f32 {
     ((q1 * q1 + q2 * q2 - q1 * q2 * coeff).max(0.0)).sqrt() / n
 }
 
+/// What a detected digit looked like, for logging and for tuning.
+#[derive(Debug, Clone, Copy)]
+pub struct DtmfHit {
+    pub digit: char,
+    /// Share of the frame's energy sitting in the two winning tones.
+    pub dominance: f32,
+    /// High group over low group.  A real digit is roughly balanced.
+    pub twist: f32,
+}
+
+pub fn detect_dtmf(samples: &[i16], rate: u32) -> Option<char> {
+    detect_dtmf_detailed(samples, rate).map(|h| h.digit)
+}
+
 /// Detect a DTMF digit in one analysis window.
 ///
 /// Requires a clear winner in each group (4x the runner-up) so speech does
 /// not produce phantom digits.
-pub fn detect_dtmf(samples: &[i16], rate: u32) -> Option<char> {
+pub fn detect_dtmf_detailed(samples: &[i16], rate: u32) -> Option<DtmfHit> {
     let rate = rate as f32;
     let low: Vec<f32> = DTMF_LOW.iter().map(|f| goertzel(samples, *f, rate)).collect();
     let high: Vec<f32> = DTMF_HIGH.iter().map(|f| goertzel(samples, *f, rate)).collect();
@@ -242,7 +256,35 @@ pub fn detect_dtmf(samples: &[i16], rate: u32) -> Option<char> {
     if lv < FLOOR || hv < FLOOR || lv < SEPARATION * lr || hv < SEPARATION * hr {
         return None;
     }
-    Some(DTMF_KEYS[li][hi])
+
+    // A digit is two tones and nothing else, so almost all of the frame's
+    // energy has to sit in those two bins.  Speech and ringback have their
+    // energy spread out and would otherwise pass the tests above now and
+    // then - a caller listening to an announcement was getting phantom
+    // digits relayed to them as SIP INFO.
+    //
+    // Measured on this ratio: a clean digit scores 0.99, one buried under
+    // 80 % noise still scores 0.85, and the loudest frame of ten seconds of
+    // recorded network announcement reaches 0.81.
+    const DOMINANCE: f32 = 0.85;
+    let mean_abs =
+        samples.iter().map(|s| s.unsigned_abs() as f32).sum::<f32>() / samples.len() as f32;
+    let dominance = if mean_abs > 0.0 { (lv + hv) / mean_abs } else { 0.0 };
+    if dominance < DOMINANCE {
+        return None;
+    }
+
+    // Twist: the two tones of a digit are generated together and arrive at
+    // comparable levels (the standard allows the high group 4 dB above and
+    // 8 dB below).  Two unrelated peaks in music or speech rarely are.
+    const TWIST_MIN: f32 = 0.3;
+    const TWIST_MAX: f32 = 2.0;
+    let twist = hv / lv;
+    if !(TWIST_MIN..=TWIST_MAX).contains(&twist) {
+        return None;
+    }
+
+    Some(DtmfHit { digit: DTMF_KEYS[li][hi], dominance, twist })
 }
 
 /// Integer-ratio linear resampler good enough for narrow-band voice.
@@ -372,6 +414,35 @@ mod tests {
             buf.extend(std::iter::repeat(0).take(800)); // 100 ms gap
         }
         assert_eq!(scan_dtmf(&buf, 8000), "0123456789*#");
+    }
+
+    /// A DTMF pair hidden inside other audio must be rejected: that is what
+    /// a network announcement looks like, and it used to be relayed to the
+    /// caller as a phantom digit.
+    #[test]
+    fn dtmf_pair_buried_in_other_audio_is_rejected() {
+        let two_pi = std::f32::consts::TAU;
+        let mut buf = Vec::new();
+        for i in 0..1600 {
+            let t = i as f32 / 8000.0;
+            // digit '2' (697 + 1336) plus company at a similar level
+            let s = 5000.0 * (two_pi * 697.0 * t).sin()
+                + 5000.0 * (two_pi * 1336.0 * t).sin()
+                + 4500.0 * (two_pi * 320.0 * t).sin()
+                + 4500.0 * (two_pi * 2400.0 * t).sin();
+            buf.push(s.clamp(-32768.0, 32767.0) as i16);
+        }
+        assert_eq!(scan_dtmf(&buf, 8000), "");
+
+        // The same pair on its own is still a digit.
+        let mut clean = Vec::new();
+        for i in 0..1600 {
+            let t = i as f32 / 8000.0;
+            clean.push(
+                (5000.0 * (two_pi * 697.0 * t).sin() + 5000.0 * (two_pi * 1336.0 * t).sin()) as i16,
+            );
+        }
+        assert_eq!(scan_dtmf(&clean, 8000), "2");
     }
 
     #[test]

@@ -174,6 +174,14 @@ pub struct Sip {
     /// Optional outbound registration to an upstream registrar (Asterisk,
     /// Kamailio, ...).  The built-in server keeps listening either way.
     pub register: Option<Upstream>,
+    /// Answer alerting with `183 Session Progress` and SDP instead of a bare
+    /// `180 Ringing`, and open the audio path straight away, so the caller
+    /// hears what the network is actually playing: its ringback tone, the
+    /// operator's announcements ("the number you have dialled is not in
+    /// service"), and IVRs that answer with early media.
+    ///
+    /// Turn it off to have the caller's own phone generate local ringback.
+    pub early_media: bool,
     /// How long an outbound INVITE may ring before it is abandoned.
     pub ring_timeout_secs: u64,
     /// User part used in the From header of gateway-originated requests.
@@ -198,6 +206,7 @@ impl Default for Sip {
             sms_target: None,
             allow: Vec::new(),
             register: None,
+            early_media: true,
             ring_timeout_secs: 60,
             from_user: None,
             options_reflect_modem: true,

@@ -191,9 +191,13 @@ async fn sender_loop(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut marker = true;
 
-    // Report a digit once, when it has been present for two frames, and not
-    // again until it goes away.
+    // Report a digit once it has been present for three consecutive frames
+    // (60 ms - a real digit lasts at least 40 ms and usually far longer), and
+    // not again until it goes away.  Two frames turned out to be short enough
+    // for a network announcement to trip it.
+    const DTMF_FRAMES: u8 = 3;
     let mut dtmf_candidate: Option<char> = None;
+    let mut dtmf_streak = 0u8;
     let mut dtmf_reported: Option<char> = None;
     let mut dtmf_gap = 0u8;
     let mut dtmf_guard = 0u8;
@@ -212,23 +216,32 @@ async fn sender_loop(
         }
 
         if let Some(tx) = inband_dtmf_tx.as_ref().filter(|_| dtmf_guard == 0) {
-            match codec::detect_dtmf(&pcm, RTP_RATE) {
-                Some(d) => {
+            match codec::detect_dtmf_detailed(&pcm, RTP_RATE) {
+                Some(hit) => {
+                    let d = hit.digit;
                     dtmf_gap = 0;
                     if dtmf_candidate == Some(d) {
-                        if dtmf_reported != Some(d) {
-                            dtmf_reported = Some(d);
-                            debug!(digit = %d, "in-band DTMF from the mobile side");
-                            let _ = tx.try_send(d);
-                        }
+                        dtmf_streak = dtmf_streak.saturating_add(1);
                     } else {
                         dtmf_candidate = Some(d);
+                        dtmf_streak = 1;
+                    }
+                    if dtmf_streak >= DTMF_FRAMES && dtmf_reported != Some(d) {
+                        dtmf_reported = Some(d);
+                        debug!(
+                            digit = %d,
+                            dominance = hit.dominance,
+                            twist = hit.twist,
+                            "in-band DTMF from the mobile side"
+                        );
+                        let _ = tx.try_send(d);
                     }
                 }
                 None => {
                     dtmf_gap = dtmf_gap.saturating_add(1);
                     if dtmf_gap >= 2 {
                         dtmf_candidate = None;
+                        dtmf_streak = 0;
                         dtmf_reported = None;
                     }
                 }

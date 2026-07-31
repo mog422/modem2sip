@@ -117,8 +117,9 @@ command on every modem-ready event with `M2S_AT_PORT`, `M2S_AT_PORTS`,
 ### Calls
 
 * **SIP → mobile**: `INVITE sip:<number>@gateway` places the call with
-  `Voice.CreateCall` + `Call.Start`. `180 Ringing` follows the modem's
-  `ringing-out` state, `200 OK` its `active` state. Only G.711 (PCMU/PCMA) at
+  `Voice.CreateCall` + `Call.Start`. Alerting is answered with `183 Session
+  Progress` and SDP so the caller hears the network itself (see below), and
+  `200 OK` follows the modem's `active` state. Only G.711 (PCMU/PCMA) at
   20 ms is offered; anything else gets `488`.
 * **mobile → SIP**: an incoming `Call` object triggers an `INVITE` to
   `sip.call_target`, or to the most recently registered contact if no target
@@ -128,6 +129,23 @@ command on every modem-ready event with `M2S_AT_PORT`, `M2S_AT_PORTS`,
   `486 Busy Here`.
 * DTMF: SIP `INFO` (`application/dtmf-relay`) and RFC 2833 both map to
   `Call.SendDtmf`; digits reported by the modem are sent to SIP as `INFO`.
+
+### Early media
+
+The mobile network starts sending audio while it is still alerting: its own
+ringback tone, the operator's announcements ("the number you have dialled is
+not in service"), and IVRs that answer with early media. A bare `180 Ringing`
+throws all of that away and leaves the caller listening to a tone their own
+phone generates.
+
+So as soon as the modem reports `ringing-out`, the gateway opens the audio
+path and answers `183 Session Progress` with SDP. The later `200 OK` carries
+the same SDP and the media session keeps running, so there is no gap at the
+moment the call connects. `[sip] early_media = false` restores the plain
+`180`.
+
+Measured on an EP06-E: audio is present in `ringing-out` at an average
+`|sample|` of 6000–7500, and the caller hears it from the 183 onwards.
 
 ### DTMF on a VoLTE call
 
