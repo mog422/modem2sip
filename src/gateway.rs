@@ -101,6 +101,11 @@ struct ActiveCall {
     ringing_sent: bool,
     /// A 183 with SDP has been sent and the audio path is already up.
     early_media: bool,
+    /// `Call.SendDtmf` was refused for this call - the codec it negotiated
+    /// leaves the firmware no way to signal a digit - so the rest of its
+    /// digits are played in-band.  Deliberately per call: the next one may
+    /// negotiate a codec that works.
+    dtmf_via_modem_failed: bool,
     cdr_id: Option<i64>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -126,9 +131,6 @@ pub struct Gateway {
     modem: Option<Arc<ModemHandle>>,
     call: Option<ActiveCall>,
     internal_tx: mpsc::Sender<Internal>,
-    /// Set once `Call.SendDtmf` has failed on this modem, so the gateway
-    /// stops asking and goes straight to in-band tones.
-    modem_dtmf_broken: bool,
 }
 
 pub async fn run(
@@ -139,14 +141,7 @@ pub async fn run(
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let (internal_tx, mut internal_rx) = mpsc::channel::<Internal>(64);
-    let mut gw = Gateway {
-        shared,
-        core,
-        modem: None,
-        call: None,
-        internal_tx,
-        modem_dtmf_broken: false,
-    };
+    let mut gw = Gateway { shared, core, modem: None, call: None, internal_tx };
     let mut watchdog = tokio::time::interval(Duration::from_secs(2));
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -194,7 +189,6 @@ impl Gateway {
         match ev {
             ModemEvent::Up(handle) => {
                 self.modem = Some(handle.clone());
-                self.modem_dtmf_broken = false;
                 self.shared.set_modem(Some(handle)).await;
                 info!("modem is up; SIP service enabled");
             }
@@ -361,6 +355,7 @@ impl Gateway {
             auth_retried: false,
             ringing_sent: false,
             early_media: false,
+            dtmf_via_modem_failed: false,
             cdr_id,
             tasks: Vec::new(),
         };
@@ -667,6 +662,7 @@ impl Gateway {
             auth_retried: false,
             ringing_sent: false,
             early_media: false,
+            dtmf_via_modem_failed: false,
             cdr_id,
             tasks: Vec::new(),
         });
@@ -1037,10 +1033,12 @@ impl Gateway {
     /// Send digits towards the mobile network.  Returns false only when
     /// every configured method failed.
     ///
-    /// On a VoLTE call there is no CS domain, and this modem's firmware maps
-    /// both `Call.SendDtmf` (QMI) and `AT+VTS` onto a request the IMS network
-    /// rejects ("network rejected request").  The gateway therefore falls
-    /// back to playing the tones into the uplink audio itself.
+    /// Whether the modem can signal a digit is decided per call, not per
+    /// modem: `Call.SendDtmf` fails when the codec negotiated for *this* call
+    /// leaves the firmware no way to send one, and the next call may
+    /// negotiate something that works.  So every call asks ModemManager
+    /// first, and only that call falls back to playing the tones into the
+    /// uplink audio itself.
     async fn deliver_dtmf(&mut self, digits: &str) -> bool {
         use crate::config::DtmfMethod;
         let method = self.shared.cfg.rtp.dtmf_method;
@@ -1048,8 +1046,10 @@ impl Gateway {
             return true;
         }
 
+        let failed_here =
+            self.call.as_ref().map(|c| c.dtmf_via_modem_failed).unwrap_or(false);
         let try_modem = matches!(method, DtmfMethod::Modem | DtmfMethod::Auto)
-            && !(method == DtmfMethod::Auto && self.modem_dtmf_broken);
+            && !(method == DtmfMethod::Auto && failed_here);
 
         if try_modem {
             let target = self
@@ -1070,10 +1070,11 @@ impl Gateway {
                         }
                         warn!(
                             error = %format!("{e:#}"),
-                            "SendDtmf failed; falling back to in-band tones for the rest of \
-                             this modem's lifetime"
+                            "SendDtmf failed; playing tones in-band for the rest of this call"
                         );
-                        self.modem_dtmf_broken = true;
+                        if let Some(call) = self.call.as_mut() {
+                            call.dtmf_via_modem_failed = true;
+                        }
                     }
                 }
             } else if method == DtmfMethod::Modem {
@@ -2108,6 +2109,7 @@ mod tests {
             auth_retried: false,
             ringing_sent: true,
             early_media: false,
+            dtmf_via_modem_failed: false,
             cdr_id: None,
             tasks: Vec::new(),
         }

@@ -163,12 +163,16 @@ requests onto the circuit-switched procedure the network then refuses.
 `mmcli --send-dtmf` fails identically, so it is not something the gateway can
 fix by calling a different API.
 
+It is not a permanent property of the modem either: whether the firmware can
+signal a digit depends on the codec negotiated for the individual call, and
+`Call.SendDtmf` does succeed on some of them.
+
 What the gateway does instead, in both directions:
 
-* **SIP → mobile**: ask ModemManager first; when it refuses, generate the
-  tones and play them into the modem's uplink audio, exactly like a handset
-  with in-band signalling. The failure is remembered, so the second digit
-  goes straight to the tone generator (`[rtp] dtmf_method`).
+* **SIP → mobile**: ask ModemManager first, on *every* call; when it refuses,
+  generate the tones and play them into the modem's uplink audio, exactly
+  like a handset with in-band signalling. Only that call keeps to the tone
+  generator — the next one asks ModemManager again (`[rtp] dtmf_method`).
 * **mobile → SIP**: watch the audio coming from the network for DTMF and
   relay what it finds as SIP `INFO` (`[rtp] detect_inband_dtmf`). While the
   gateway is playing a digit the detector is muted, so the modem's sidetone
