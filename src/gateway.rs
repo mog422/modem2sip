@@ -313,7 +313,7 @@ impl Gateway {
             params: Vec::new(),
         }
         .with_tag(&local_tag);
-        let to = NameAddr::new(target_uri.bare());
+        let to = NameAddr::new(addressed_to_us(&target_uri, self.shared.own_number().await));
         let call_id = format!("{}@modem2sip", crate::sip::auth::random_hex(10));
         let cseq = self.core.next_cseq();
 
@@ -1799,7 +1799,7 @@ pub async fn notify_sip_message(
     }
     .with_tag(&crate::sip::auth::random_hex(6));
     // Mark what this is: `To: <sip:user@host>;messagetype=sms`.
-    let mut to = NameAddr::new(target_uri.bare());
+    let mut to = NameAddr::new(addressed_to_us(&target_uri, shared.own_number().await));
     to.set_param(MESSAGE_TYPE_PARAM, Some(MESSAGE_TYPE_SMS));
     let call_id = format!("{}@modem2sip", crate::sip::auth::random_hex(10));
 
@@ -2135,6 +2135,22 @@ fn incoming_sms_id(path: &OwnedObjectPath, info: &SmsInfo, peer: &str) -> String
     }
 }
 
+/// Address something arriving from the mobile side to the line it arrived on.
+///
+/// The target URI says where to *send* the request - a registered contact or
+/// the configured peer, whose user part is an account name like `phone1`.
+/// The To header says who was *called*, and for a call or a message off the
+/// air that is this modem's own number, which is what lets a client with
+/// several lines tell them apart.  Without a number to use, the target is
+/// left as it is.
+fn addressed_to_us(target: &Uri, own_number: Option<String>) -> Uri {
+    let mut uri = target.bare();
+    if let Some(number) = own_number.filter(|n| !n.trim().is_empty()) {
+        uri.user = Some(number.trim().to_string());
+    }
+    uri
+}
+
 /// Keep digits and the few characters that are meaningful for dialling.
 pub fn sanitize_number(raw: &str) -> String {
     let raw = raw.trim();
@@ -2171,6 +2187,21 @@ fn parse_dtmf_info(content_type: &str, body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inbound_is_addressed_to_the_modems_own_number() {
+        let target = Uri::parse("sip:phone1@192.168.1.10:5060;transport=udp").unwrap();
+
+        // The account name is replaced, the address it routes to is not.
+        let to = addressed_to_us(&target, Some("821012345678".into()));
+        assert_eq!(to.to_string(), "sip:821012345678@192.168.1.10:5060");
+
+        // Nothing to put there: leave the target alone rather than invent one.
+        let to = addressed_to_us(&target, None);
+        assert_eq!(to.to_string(), "sip:phone1@192.168.1.10:5060");
+        let to = addressed_to_us(&target, Some("   ".into()));
+        assert_eq!(to.to_string(), "sip:phone1@192.168.1.10:5060");
+    }
 
     #[test]
     fn number_sanitisation() {

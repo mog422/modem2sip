@@ -131,6 +131,19 @@ command on every modem-ready event with `M2S_AT_PORT`, `M2S_AT_PORTS`,
   `sip.call_target`, or to the most recently registered contact if no target
   is configured. The network call is only accepted once SIP has answered and
   the audio path is open, so nothing is clipped.
+
+Anything arriving from the mobile side — a call, an SMS, an MMS — is
+addressed to the line it arrived on: the `To` header carries the modem's own
+number rather than the account name the request is routed to, so a client
+watching several gateways can tell them apart.
+
+```
+INVITE sip:phone1@192.168.1.10:5060 SIP/2.0     <- where it goes
+To: <sip:821012345678@192.168.1.10:5060>        <- which line it came in on
+```
+
+The number is the one the SIM reports, or `[modem] own_number` when it
+reports none; without either, the target address is left as it is.
 * Only one call at a time (one modem, one audio card): further `INVITE`s get
   `486 Busy Here`.
 * DTMF: SIP `INFO` (`application/dtmf-relay`) and RFC 2833 both map to

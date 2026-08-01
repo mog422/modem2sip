@@ -52,6 +52,20 @@ impl Shared {
         self.modem.read().await.clone()
     }
 
+    /// The number this line answers on, as reported by the SIM and otherwise
+    /// as configured.  Used to address what arrives from the mobile side, so
+    /// a SIP client can tell which line a call or message came in on.
+    pub async fn own_number(&self) -> Option<String> {
+        let from_sim = self
+            .modem()
+            .await
+            .and_then(|m| m.info.own_number.clone())
+            .filter(|n| !n.trim().is_empty());
+        from_sim.or_else(|| {
+            self.cfg.modem.own_number.clone().filter(|n| !n.trim().is_empty())
+        })
+    }
+
     pub fn is_ready(&self) -> bool {
         self.modem_ready.load(Ordering::Relaxed)
     }
