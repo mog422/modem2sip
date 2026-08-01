@@ -313,13 +313,17 @@ impl Gateway {
             params: Vec::new(),
         }
         .with_tag(&local_tag);
-        let to = NameAddr::new(addressed_to_us(&target_uri, self.shared.own_number().await));
+        // Both the first line and the To header name the line this arrived
+        // on; the request still travels to the target's address.
+        let own_number = self.shared.own_number().await;
+        let request_uri = addressed_to_us(&target_uri, own_number.as_deref());
+        let to = NameAddr::new(addressed_to_us(&target_uri.bare(), own_number.as_deref()));
         let call_id = format!("{}@modem2sip", crate::sip::auth::random_hex(10));
         let cseq = self.core.next_cseq();
 
         let mut invite = self.core.build_request(
             Method::Invite,
-            target_uri.clone(),
+            request_uri,
             from.clone(),
             to.clone(),
             &call_id,
@@ -1799,13 +1803,15 @@ pub async fn notify_sip_message(
     }
     .with_tag(&crate::sip::auth::random_hex(6));
     // Mark what this is: `To: <sip:user@host>;messagetype=sms`.
-    let mut to = NameAddr::new(addressed_to_us(&target_uri, shared.own_number().await));
+    let own_number = shared.own_number().await;
+    let request_uri = addressed_to_us(&target_uri, own_number.as_deref());
+    let mut to = NameAddr::new(addressed_to_us(&target_uri.bare(), own_number.as_deref()));
     to.set_param(MESSAGE_TYPE_PARAM, Some(MESSAGE_TYPE_SMS));
     let call_id = format!("{}@modem2sip", crate::sip::auth::random_hex(10));
 
     let mut req = core.build_request(
         Method::Message,
-        target_uri,
+        request_uri,
         from,
         to,
         &call_id,
@@ -2143,10 +2149,10 @@ fn incoming_sms_id(path: &OwnedObjectPath, info: &SmsInfo, peer: &str) -> String
 /// air that is this modem's own number, which is what lets a client with
 /// several lines tell them apart.  Without a number to use, the target is
 /// left as it is.
-fn addressed_to_us(target: &Uri, own_number: Option<String>) -> Uri {
-    let mut uri = target.bare();
-    if let Some(number) = own_number.filter(|n| !n.trim().is_empty()) {
-        uri.user = Some(number.trim().to_string());
+fn addressed_to_us(target: &Uri, own_number: Option<&str>) -> Uri {
+    let mut uri = target.clone();
+    if let Some(number) = own_number.map(str::trim).filter(|n| !n.is_empty()) {
+        uri.user = Some(number.to_string());
     }
     uri
 }
@@ -2192,15 +2198,24 @@ mod tests {
     fn inbound_is_addressed_to_the_modems_own_number() {
         let target = Uri::parse("sip:phone1@192.168.1.10:5060;transport=udp").unwrap();
 
-        // The account name is replaced, the address it routes to is not.
-        let to = addressed_to_us(&target, Some("821012345678".into()));
+        // The account name is replaced; the address and its parameters, which
+        // are what carry the request, are left alone.
+        let ruri = addressed_to_us(&target, Some("821012345678"));
+        assert_eq!(ruri.to_string(), "sip:821012345678@192.168.1.10:5060;transport=udp");
+
+        // The To header takes the same name without the routing parameters.
+        let to = addressed_to_us(&target.bare(), Some("821012345678"));
         assert_eq!(to.to_string(), "sip:821012345678@192.168.1.10:5060");
 
         // Nothing to put there: leave the target alone rather than invent one.
-        let to = addressed_to_us(&target, None);
-        assert_eq!(to.to_string(), "sip:phone1@192.168.1.10:5060");
-        let to = addressed_to_us(&target, Some("   ".into()));
-        assert_eq!(to.to_string(), "sip:phone1@192.168.1.10:5060");
+        assert_eq!(
+            addressed_to_us(&target, None).to_string(),
+            "sip:phone1@192.168.1.10:5060;transport=udp"
+        );
+        assert_eq!(
+            addressed_to_us(&target, Some("   ")).to_string(),
+            "sip:phone1@192.168.1.10:5060;transport=udp"
+        );
     }
 
     #[test]

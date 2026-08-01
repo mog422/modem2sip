@@ -138,9 +138,12 @@ number rather than the account name the request is routed to, so a client
 watching several gateways can tell them apart.
 
 ```
-INVITE sip:phone1@192.168.1.10:5060 SIP/2.0     <- where it goes
-To: <sip:821012345678@192.168.1.10:5060>        <- which line it came in on
+INVITE sip:01012345678@192.168.1.10:5060 SIP/2.0
+To: <sip:01012345678@192.168.1.10:5060>
 ```
+
+The request still travels to the target's address — only the user part is
+rewritten, and any parameters the target carries are kept.
 
 The number is `[modem] own_number` when set, otherwise the one the SIM
 reports; without either, the target address is left as it is. SIMs report it
