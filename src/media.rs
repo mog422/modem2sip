@@ -237,6 +237,12 @@ impl MediaSession {
         self.rings.reset_uplink_level();
     }
 
+    /// Shared handle on the buffers, for watching the level while a call is
+    /// still being set up.
+    pub fn rings(&self) -> Arc<AudioRings> {
+        self.rings.clone()
+    }
+
     pub fn audio_failed(&self) -> bool {
         self.audio.as_ref().map(|a| a.is_failed()).unwrap_or(false)
     }

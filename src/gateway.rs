@@ -41,6 +41,8 @@ enum Internal {
     SipAnswered { call_id: String, resp: Box<Response> },
     SipFailed { call_id: String, resp: Box<Response> },
     RingTimeout { call_id: String },
+    /// The network started sending audio while the call was still ringing.
+    EarlyMediaAudio { call_id: String, level: u32 },
     /// An RFC 2833 digit arrived in the RTP stream (SIP -> modem).
     Dtmf { call_id: String, digit: char },
     /// A DTMF tone was heard in the audio from the mobile side (modem -> SIP).
@@ -442,15 +444,19 @@ impl Gateway {
                 // What did the caller actually hear while it was ringing?
                 // Silence here means the network sent no ringback, and a
                 // plain 180 would have served them better.
-                if let Some((level, frames)) =
-                    self.call.as_ref().filter(|c| c.early_media).and_then(|c| {
-                        c.media.as_ref().map(|m| m.uplink_level())
+                if let Some((level, frames, upgraded)) =
+                    self.call.as_ref().filter(|c| c.ringing_sent).and_then(|c| {
+                        c.media.as_ref().map(|m| {
+                            let (l, f) = m.uplink_level();
+                            (l, f, c.early_media)
+                        })
                     })
                 {
                     info!(
                         level,
                         ms = frames * 20,
-                        "early media ended (level 0 means the network sent nothing)"
+                        early_media = upgraded,
+                        "ringing ended; level is what the caller was sent while waiting"
                     );
                 }
                 if let Err(e) = self.answer_sip_caller().await {
@@ -486,16 +492,58 @@ impl Gateway {
     /// ringback, or an announcement explaining why the call will not connect -
     /// and a bare `180 Ringing` would throw that away and have the caller's
     /// phone generate a local tone instead.
+    /// Alerting has started.  Open the audio path and answer `180`, then wait
+    /// to see whether the network actually sends anything.
+    ///
+    /// Announcing early media the moment the network says "alerting" is a bet
+    /// that it has something to play, and it does not always: a call can ring
+    /// for ten seconds at a level of 22, which is the noise floor.  A caller
+    /// told to listen to that hears silence, where `180` would have had their
+    /// own phone ring.  So the `183` waits for audio to actually turn up.
     async fn start_early_media(&mut self) -> Result<()> {
+        self.open_media_for_early_media().await?;
+        self.send_provisional(180).await;
+
+        let Some(call) = self.call.as_mut() else { return Ok(()) };
+        let Some(media) = call.media.as_ref() else { return Ok(()) };
+        media.reset_uplink_level();
+
+        let rings = media.rings();
+        let tx = self.internal_tx.clone();
+        let call_id = call.call_id.clone();
+        call.tasks.push(tokio::spawn(async move {
+            watch_for_early_media(rings, call_id, tx).await;
+        }));
+        Ok(())
+    }
+
+    /// Start the media session without answering anything yet, so the audio
+    /// the network sends while alerting is already being captured.
+    async fn open_media_for_early_media(&mut self) -> Result<()> {
+        if self.call.as_ref().and_then(|c| c.media.as_ref()).is_some() {
+            return Ok(());
+        }
+        let Some((remote_sdp, codec)) =
+            self.call.as_ref().map(|c| (c.remote_sdp.clone(), c.codec))
+        else {
+            return Ok(());
+        };
+        let remote_sdp = remote_sdp.ok_or_else(|| anyhow!("no remote SDP"))?;
+        let remote_media = SocketAddr::new(remote_sdp.address, remote_sdp.port);
+        self.start_media(remote_media, codec).await
+    }
+
+    /// The network started sending audio while the call was ringing: tell the
+    /// caller to listen to it.
+    async fn upgrade_to_early_media(&mut self, level: u32) -> Result<()> {
+        if self.call.as_ref().map(|c| c.early_media || c.answered).unwrap_or(true) {
+            return Ok(());
+        }
         self.respond_with_media(183).await?;
         if let Some(call) = self.call.as_mut() {
-            call.ringing_sent = true;
             call.early_media = true;
-            if let Some(media) = call.media.as_ref() {
-                media.reset_uplink_level();
-            }
         }
-        info!("early media: the caller now hears the network");
+        info!(level, "early media: the caller now hears the network");
         Ok(())
     }
 
@@ -1016,6 +1064,12 @@ impl Gateway {
                 self.finish_call("sip rejected").await;
                 Ok(())
             }
+            Internal::EarlyMediaAudio { call_id, level } => {
+                if self.call_id_matches(&call_id) {
+                    self.upgrade_to_early_media(level).await?;
+                }
+                Ok(())
+            }
             Internal::Dtmf { call_id, digit } => {
                 if self.call_id_matches(&call_id) {
                     self.deliver_dtmf(&digit.to_string()).await;
@@ -1455,13 +1509,23 @@ impl Gateway {
             return;
         };
         info!(reason, code, "tearing down the call");
-        if let Some((level, frames)) = self
+        if let Some((level, frames, upgraded)) = self
             .call
             .as_ref()
-            .filter(|c| c.early_media && !c.answered)
-            .and_then(|c| c.media.as_ref().map(|m| m.uplink_level()))
+            .filter(|c| c.ringing_sent && !c.answered)
+            .and_then(|c| {
+                c.media.as_ref().map(|m| {
+                    let (l, f) = m.uplink_level();
+                    (l, f, c.early_media)
+                })
+            })
         {
-            info!(level, ms = frames * 20, "early media ended without an answer");
+            info!(
+                level,
+                ms = frames * 20,
+                early_media = upgraded,
+                "ringing ended without an answer"
+            );
         }
 
         if let Some(bye) = snap.bye {
@@ -1818,6 +1882,49 @@ fn human_size(bytes: i64) -> String {
         format!("{bytes} B")
     } else {
         format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// Watch what the modem is sending towards the caller while a call is
+/// ringing, and report the moment it stops being silence.
+///
+/// Measured levels: the noise floor of an idle path is around 20, a ringback
+/// tone or an announcement is a few thousand.  Two consecutive windows above
+/// the threshold keep a click from counting.
+async fn watch_for_early_media(
+    rings: Arc<crate::audio::AudioRings>,
+    call_id: String,
+    tx: mpsc::Sender<Internal>,
+) {
+    const WINDOW: Duration = Duration::from_millis(120);
+    const THRESHOLD: u32 = 150;
+    const NEEDED: u8 = 2;
+
+    let (mut last_energy, mut last_frames) = rings.uplink_raw();
+    let mut streak = 0u8;
+    let mut ticker = tokio::time::interval(WINDOW);
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+        let (energy, frames) = rings.uplink_raw();
+        let (d_energy, d_frames) =
+            (energy.saturating_sub(last_energy), frames.saturating_sub(last_frames));
+        last_energy = energy;
+        last_frames = frames;
+        if d_frames == 0 {
+            continue;
+        }
+        let level = d_energy / d_frames;
+        if level >= THRESHOLD {
+            streak += 1;
+            if streak >= NEEDED {
+                let _ = tx.send(Internal::EarlyMediaAudio { call_id, level }).await;
+                return;
+            }
+        } else {
+            streak = 0;
+        }
     }
 }
 

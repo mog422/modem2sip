@@ -114,9 +114,17 @@ impl AudioRings {
     /// Average |sample| sent to the SIP peer since the last reset, and how
     /// many 20 ms frames that covers.
     pub fn uplink_level(&self) -> (u32, u32) {
-        let frames = self.uplink_frames.load(Ordering::Relaxed);
-        let energy = self.uplink_energy.load(Ordering::Relaxed);
+        let (energy, frames) = self.uplink_raw();
         (energy / frames.max(1), frames)
+    }
+
+    /// The running sums behind [`Self::uplink_level`], so a caller can take
+    /// differences and get the level over a window of its own choosing.
+    pub fn uplink_raw(&self) -> (u32, u32) {
+        (
+            self.uplink_energy.load(Ordering::Relaxed),
+            self.uplink_frames.load(Ordering::Relaxed),
+        )
     }
 
     pub fn reset_uplink_level(&self) {

@@ -144,31 +144,41 @@ not in service"), and IVRs that answer with early media. A bare `180 Ringing`
 throws all of that away and leaves the caller listening to a tone their own
 phone generates.
 
-So as soon as the modem reports `ringing-out`, the gateway opens the audio
-path and answers `183 Session Progress` with SDP. The later `200 OK` carries
-the same SDP and the media session keeps running, so there is no gap at the
-moment the call connects. `[sip] early_media = false` restores the plain
-`180`.
+But the network does not always have something to play — a call can ring for
+twenty-four seconds while the audio path carries nothing but its noise floor,
+and a caller told to listen to *that* hears silence where `180` would have
+had their own phone ring.
+
+So the gateway does both, in the order the network decides. When alerting
+starts it opens the audio path and answers `180 Ringing`, and it watches what
+the modem is actually sending. The moment real audio appears it sends
+`183 Session Progress` with SDP and the caller hears the network instead; if
+nothing ever appears, the call just rings. The `200 OK` carries the same SDP
+and the media session keeps running, so there is no gap when the call
+connects. `[sip] early_media = false` stays on `180` throughout.
 
 Measured on an EP06-E: audio is present in `ringing-out` at an average
 `|sample|` of 6000–7500, and the caller hears it from the 183 onwards.
 
-Whether a particular call really carried ringback is reported when it ends,
-because "the caller heard nothing" and "the network sent nothing" look the
-same from the SIP side:
+Every call reports what the caller was actually sent while it rang, because
+"the caller heard nothing" and "the network sent nothing" look the same from
+the SIP side:
 
 ```
-INFO early media: the caller now hears the network
-INFO early media ended without an answer level=2957 ms=24360
+INFO early media: the caller now hears the network level=3743
+INFO ringing ended without an answer level=2957 ms=24360 early_media=true
+INFO ringing ended without an answer level=0 ms=24480 early_media=false
 ```
 
-`level` is the average `|sample|` sent to the caller while the call was
-ringing — a few thousand is speech or a ringback tone, and 0 means the
-network sent silence, in which case a plain `180` would have served the
-caller better (`[sip] early_media = false`). ModemManager has no API for
-QMI's alerting type, and this modem does not report one in its
-`ALL_CALL_STATUS` indication either, so measuring the audio is how the
-question gets answered.
+`level` is the average `|sample|`: a few thousand is a ringback tone or an
+announcement, and the noise floor of a silent path is about 20. If a caller
+reports hearing nothing on a call whose level was in the thousands, the audio
+was sent and their client did not play it.
+
+This is measured rather than asked because there is nothing to ask:
+ModemManager exposes nothing about QMI's alerting type — which is exactly the
+network-or-handset distinction at stake — libqmi 1.38 does not define the
+enum, and the modem sends no such TLV in its `ALL_CALL_STATUS` indication.
 
 ### DTMF on a VoLTE call
 
