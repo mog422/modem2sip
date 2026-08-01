@@ -58,7 +58,20 @@ fn is_quectel_model(model: &str) -> bool {
 /// Returns the port that accepted the command.  Best effort: a failure means
 /// calls may be silent, not that the modem is unusable, so callers log and
 /// carry on.
-pub async fn enable_usb_audio(info: &ModemInfo, force: bool) -> Result<String> {
+pub async fn enable_usb_audio(modem: &crate::mm::ModemHandle, force: bool) -> Result<String> {
+    // ModemManager's own AT channel is the better route when it is open: it
+    // serialises with MM's own traffic on a port MM keeps open anyway.  It is
+    // only allowed when MM runs with `--debug`, so the answer is remembered
+    // and the serial port is used everywhere else.
+    if mm_command_worth_trying() {
+        match via_modem_manager(modem, force).await {
+            Some(Ok(())) => return Ok("ModemManager".into()),
+            Some(Err(e)) => return Err(e),
+            None => {}
+        }
+    }
+
+    let info = &modem.info;
     if info.at_ports.is_empty() {
         bail!("ModemManager reports no AT port for this modem");
     }
@@ -86,6 +99,73 @@ pub async fn enable_usb_audio(info: &ModemInfo, force: bool) -> Result<String> {
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow!("no usable AT port")))
+}
+
+/// Has `Modem.Command` ever been allowed?  0 = not asked yet, 1 = yes,
+/// 2 = refused, do not ask again.
+static MM_COMMAND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn mm_command_worth_trying() -> bool {
+    MM_COMMAND.load(std::sync::atomic::Ordering::Relaxed) != 2
+}
+
+/// Ask again next time.  Called when a modem becomes ready, because that is
+/// also what happens when ModemManager itself is restarted - possibly into
+/// (or out of) debug mode, which is what decides the answer.
+pub fn forget_mm_command_support() {
+    MM_COMMAND.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `Some` when ModemManager handled the exchange (well or badly), `None` when
+/// it will not carry AT commands for us at all.
+async fn via_modem_manager(modem: &crate::mm::ModemHandle, force: bool) -> Option<Result<()>> {
+    use std::sync::atomic::Ordering;
+
+    let ask = |cmd: &'static str| async move { modem.modem.command(cmd, 3000).await };
+
+    if !force {
+        match ask("AT+QPCMV?").await {
+            Ok(reply) => {
+                MM_COMMAND.store(1, Ordering::Relaxed);
+                if reply.trim_start_matches("+QPCMV:").trim().starts_with('1') {
+                    debug!("USB voice path already enabled (via ModemManager)");
+                    return Some(Ok(()));
+                }
+            }
+            Err(e) => {
+                if is_unauthorized(&e) {
+                    debug!(
+                        "ModemManager will not relay AT commands (it is not in debug mode); \
+                         using the modem's AT port directly"
+                    );
+                    MM_COMMAND.store(2, Ordering::Relaxed);
+                    return None;
+                }
+                debug!(error = %e, "Modem.Command failed");
+                return Some(Err(anyhow!("Modem.Command: {e}")));
+            }
+        }
+    }
+
+    match ask("AT+QPCMV=1,2").await {
+        Ok(_) => {
+            MM_COMMAND.store(1, Ordering::Relaxed);
+            info!("enabled the modem's USB voice path (AT+QPCMV=1,2 via ModemManager)");
+            Some(Ok(()))
+        }
+        Err(e) if is_unauthorized(&e) => {
+            MM_COMMAND.store(2, Ordering::Relaxed);
+            None
+        }
+        Err(e) => Some(Err(anyhow!("Modem.Command AT+QPCMV=1,2: {e}"))),
+    }
+}
+
+fn is_unauthorized(e: &zbus::Error) -> bool {
+    // MM answers `...Error.Core.Unauthorized: Operation only allowed in debug
+    // mode` when it was not started with --debug.
+    let text = e.to_string();
+    text.contains("Unauthorized") || text.contains("debug mode")
 }
 
 enum Outcome {

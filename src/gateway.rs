@@ -1332,7 +1332,7 @@ impl Gateway {
         // USB voice path again, which shows up as a perfectly connected but
         // completely silent call.  Cheap to re-check right here.
         if crate::vendor::applies(self.shared.cfg.audio.vendor_audio_setup, &modem.info) {
-            if let Err(e) = crate::vendor::enable_usb_audio(&modem.info, false).await {
+            if let Err(e) = crate::vendor::enable_usb_audio(&modem, false).await {
                 warn!(
                     error = %format!("{e:#}"),
                     "could not confirm the modem's USB voice path; audio may be silent"

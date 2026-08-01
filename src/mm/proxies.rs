@@ -123,6 +123,10 @@ pub trait Modem {
     fn create_bearer(&self, properties: HashMap<&str, Value<'_>>) -> zbus::Result<OwnedObjectPath>;
     fn delete_bearer(&self, bearer: &OwnedObjectPath) -> zbus::Result<()>;
     fn set_power_state(&self, state: u32) -> zbus::Result<()>;
+    /// Send an AT command through ModemManager's own channel, so it is
+    /// serialised with whatever else MM is doing on that port.  Refused with
+    /// `Unauthorized` unless ModemManager was started with `--debug`.
+    fn command(&self, cmd: &str, timeout: u32) -> zbus::Result<String>;
 
     /// sysfs path of the physical device, e.g.
     /// `/sys/devices/pci0000:00/0000:00:14.0/usb1/1-3`.

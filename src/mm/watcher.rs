@@ -298,8 +298,9 @@ async fn activate(
 
     // Vendor audio path (Quectel: AT+QPCMV=1,2).  Not fatal: SMS still works
     // on a modem whose voice path we could not switch on.
+    crate::vendor::forget_mm_command_support();
     if crate::vendor::applies(cfg.audio.vendor_audio_setup, &handle.info) {
-        match crate::vendor::enable_usb_audio(&handle.info, false).await {
+        match crate::vendor::enable_usb_audio(&handle, false).await {
             Ok(port) => debug!(port, "USB voice path ready"),
             Err(e) => warn!(
                 error = %format!("{e:#}"),

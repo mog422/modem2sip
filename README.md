@@ -89,7 +89,10 @@ which is exactly what `asterisk-chan-quectel` does, and what ModemManager has
 no D-Bus API for.
 
 [src/vendor.rs](src/vendor.rs) is the one place in this crate that talks AT,
-and it exists only for that switch:
+and it exists only for that switch. It asks ModemManager to carry the command
+first — `Modem.Command`, which serialises with MM's own traffic — and opens
+the AT port itself only when MM refuses, which it does unless it was started
+with `--debug`:
 
 ```toml
 [audio]
@@ -99,8 +102,11 @@ vendor_audio_setup = "auto"   # "auto" (Quectel only) | "always" | "never"
 * runs on every modem-ready event, so a replug or a modem reset is covered
   (the setting is volatile);
 * re-checks before each call and only writes when the path is actually off;
-* uses a port *ModemManager itself* classified as AT, preferring the last one
-  (MM tends to keep the first for itself);
+* falls back to a port *ModemManager itself* classified as AT, preferring the
+  last one (MM tends to keep the first for itself);
+* re-checks whether ModemManager will relay commands whenever a modem becomes
+  ready, so switching MM in or out of debug mode is picked up without
+  restarting the gateway;
 * warns if `AT+QDAI` is not `5`, but never changes it — that one is persistent
   and needs a modem reset, so it stays an operator decision;
 * a failure is logged, not fatal: SMS keeps working on a modem whose voice
