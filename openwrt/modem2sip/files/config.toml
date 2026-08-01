@@ -16,6 +16,11 @@ log = "modem2sip=info"
 # soon as there is more than one - IMEI is the stable choice.
 # imei = "356938035643809"
 enable = true
+# The SIM reports the own number in international format; with the country
+# code set it is shown nationally (821012345678 -> 01012345678) in the To
+# header of incoming calls and messages.
+# country_code    = "82"
+# national_prefix = "0"
 
 [audio]
 # The ALSA card is found by walking sysfs from the modem's device path, so it

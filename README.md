@@ -142,8 +142,13 @@ INVITE sip:phone1@192.168.1.10:5060 SIP/2.0     <- where it goes
 To: <sip:821012345678@192.168.1.10:5060>        <- which line it came in on
 ```
 
-The number is the one the SIM reports, or `[modem] own_number` when it
-reports none; without either, the target address is left as it is.
+The number is `[modem] own_number` when set, otherwise the one the SIM
+reports; without either, the target address is left as it is. SIMs report it
+in international format, so `[modem] country_code` renders it the way it is
+written locally — with `country_code = "82"`, `821012345678` becomes
+`01012345678`, which is also the form the network uses for the sender in
+`From`. `national_prefix` defaults to `0`; leave it empty for the North
+American plan.
 * Only one call at a time (one modem, one audio card): further `INVITE`s get
   `486 Busy Here`.
 * DTMF: SIP `INFO` (`application/dtmf-relay`) and RFC 2833 both map to

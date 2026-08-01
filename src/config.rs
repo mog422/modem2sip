@@ -64,9 +64,17 @@ pub struct ModemMatch {
     pub index: Option<u32>,
     /// Enable the modem if ModemManager reports it as disabled.
     pub enable: bool,
-    /// Own MSISDN. Used as the SIP user part for outbound notifications when
-    /// the SIM does not report one.
+    /// Own MSISDN, overriding whatever the SIM reports.  Used to address
+    /// calls and messages arriving from the mobile side.
     pub own_number: Option<String>,
+    /// Country code of this line, without `+` (e.g. "82").  SIMs report the
+    /// own number in international format, and a national one is usually what
+    /// people expect to see: with this set, `821012345678` is rendered as
+    /// `01012345678`.  Unset means the number is used exactly as reported.
+    pub country_code: Option<String>,
+    /// Trunk prefix that replaces the country code.  "0" nearly everywhere;
+    /// set it empty for the North American plan, which has none.
+    pub national_prefix: String,
     /// Shell command run every time the modem becomes ready (also after a
     /// replug).  The escape hatch for vendor knobs ModemManager does not
     /// expose.  The Quectel USB voice path is handled natively instead - see
@@ -90,6 +98,8 @@ impl Default for ModemMatch {
             // Enabling a disabled modem is what an unattended gateway wants.
             enable: true,
             own_number: None,
+            country_code: None,
+            national_prefix: "0".into(),
             ready_command: None,
         }
     }
