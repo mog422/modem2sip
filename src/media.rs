@@ -227,6 +227,16 @@ impl MediaSession {
         self.clock.stamp();
     }
 
+    /// Average level of what has been sent to the SIP peer, and over how many
+    /// 20 ms frames.  Answers "was the network actually sending ringback?"
+    pub fn uplink_level(&self) -> (u32, u32) {
+        self.rings.uplink_level()
+    }
+
+    pub fn reset_uplink_level(&self) {
+        self.rings.reset_uplink_level();
+    }
+
     pub fn audio_failed(&self) -> bool {
         self.audio.as_ref().map(|a| a.is_failed()).unwrap_or(false)
     }

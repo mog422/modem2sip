@@ -153,6 +153,23 @@ moment the call connects. `[sip] early_media = false` restores the plain
 Measured on an EP06-E: audio is present in `ringing-out` at an average
 `|sample|` of 6000–7500, and the caller hears it from the 183 onwards.
 
+Whether a particular call really carried ringback is reported when it ends,
+because "the caller heard nothing" and "the network sent nothing" look the
+same from the SIP side:
+
+```
+INFO early media: the caller now hears the network
+INFO early media ended without an answer level=2957 ms=24360
+```
+
+`level` is the average `|sample|` sent to the caller while the call was
+ringing — a few thousand is speech or a ringback tone, and 0 means the
+network sent silence, in which case a plain `180` would have served the
+caller better (`[sip] early_media = false`). ModemManager has no API for
+QMI's alerting type, and this modem does not report one in its
+`ALL_CALL_STATUS` indication either, so measuring the audio is how the
+question gets answered.
+
 ### DTMF on a VoLTE call
 
 Neither of the two ways a modem is normally asked to produce a digit works on

@@ -59,6 +59,9 @@ pub struct AudioRings {
     high_water: usize,
     pub underruns: AtomicU32,
     pub overruns: AtomicU32,
+    /// Sum of per-frame average levels sent towards SIP, and the frame count.
+    uplink_energy: AtomicU32,
+    uplink_frames: AtomicU32,
 }
 
 /// Hard ceiling on queued DTMF, in samples (~8 s at 8 kHz).
@@ -93,10 +96,32 @@ impl AudioRings {
     pub fn take_for_network(&self, n: usize) -> Vec<i16> {
         let mut ring = self.to_network.lock().unwrap();
         let mut out = Vec::with_capacity(n);
+        let mut energy: u32 = 0;
         for _ in 0..n {
-            out.push(ring.pop_front().unwrap_or(0));
+            let s = ring.pop_front().unwrap_or(0);
+            energy = energy.saturating_add(s.unsigned_abs() as u32);
+            out.push(s);
         }
+        // Running level of what the SIP side is being sent.  Silence here
+        // while a call is alerting means the network is not providing
+        // ringback, which is the difference between the caller hearing
+        // something and hearing nothing.
+        self.uplink_energy.fetch_add(energy / n.max(1) as u32, Ordering::Relaxed);
+        self.uplink_frames.fetch_add(1, Ordering::Relaxed);
         out
+    }
+
+    /// Average |sample| sent to the SIP peer since the last reset, and how
+    /// many 20 ms frames that covers.
+    pub fn uplink_level(&self) -> (u32, u32) {
+        let frames = self.uplink_frames.load(Ordering::Relaxed);
+        let energy = self.uplink_energy.load(Ordering::Relaxed);
+        (energy / frames.max(1), frames)
+    }
+
+    pub fn reset_uplink_level(&self) {
+        self.uplink_energy.store(0, Ordering::Relaxed);
+        self.uplink_frames.store(0, Ordering::Relaxed);
     }
 
     fn push_from_card(&self, samples: &[i16]) {

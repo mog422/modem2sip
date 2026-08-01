@@ -439,6 +439,20 @@ impl Gateway {
                 // while the caller has had no final response at all, so the
                 // whole call has to come down rather than the error just
                 // being logged by the event loop.
+                // What did the caller actually hear while it was ringing?
+                // Silence here means the network sent no ringback, and a
+                // plain 180 would have served them better.
+                if let Some((level, frames)) =
+                    self.call.as_ref().filter(|c| c.early_media).and_then(|c| {
+                        c.media.as_ref().map(|m| m.uplink_level())
+                    })
+                {
+                    info!(
+                        level,
+                        ms = frames * 20,
+                        "early media ended (level 0 means the network sent nothing)"
+                    );
+                }
                 if let Err(e) = self.answer_sip_caller().await {
                     error!(error = %format!("{e:#}"), "could not answer the SIP caller");
                     self.teardown_call("answering the SIP caller failed", 500).await;
@@ -477,6 +491,9 @@ impl Gateway {
         if let Some(call) = self.call.as_mut() {
             call.ringing_sent = true;
             call.early_media = true;
+            if let Some(media) = call.media.as_ref() {
+                media.reset_uplink_level();
+            }
         }
         info!("early media: the caller now hears the network");
         Ok(())
@@ -1438,6 +1455,14 @@ impl Gateway {
             return;
         };
         info!(reason, code, "tearing down the call");
+        if let Some((level, frames)) = self
+            .call
+            .as_ref()
+            .filter(|c| c.early_media && !c.answered)
+            .and_then(|c| c.media.as_ref().map(|m| m.uplink_level()))
+        {
+            info!(level, ms = frames * 20, "early media ended without an answer");
+        }
 
         if let Some(bye) = snap.bye {
             let core = self.core.clone();
