@@ -1594,14 +1594,6 @@ impl Gateway {
         info: SmsInfo,
     ) -> Result<()> {
         let peer = sanitize_number(&info.number);
-        // Object paths are reused after a restart, so the identity also uses
-        // the network timestamp and the sender.
-        let external_id = format!(
-            "{}|{}|{}",
-            path.as_str(),
-            info.timestamp.clone().unwrap_or_default(),
-            peer
-        );
 
         let stored = self
             .shared
@@ -1615,7 +1607,7 @@ impl Gateway {
                 text: Some(info.text.clone()),
                 timestamp: info.timestamp.clone(),
                 status: "received".into(),
-                external_id: Some(external_id),
+                external_id: Some(incoming_sms_id(&path, &info, &peer)),
                 raw: if info.data.is_empty() { None } else { Some(info.data.clone()) },
             })
             .await?;
@@ -1987,6 +1979,27 @@ fn normalise_alsa(port: &str) -> String {
 /// is kept only because it is what links the row to the modem's object.
 fn outgoing_sms_id(path: &OwnedObjectPath) -> String {
     format!("{}|{}", path.as_str(), crate::db::now_iso())
+}
+
+/// Identity of a received message, for de-duplication.
+///
+/// A message the modem keeps in its own storage is announced again every time
+/// the modem comes back, and ModemManager renumbers its objects when it does,
+/// so `/SMS/4` becomes `/SMS/11` and a key built on the object path lets the
+/// same message in twice.  What does not change is what the network said:
+/// when it arrived, who sent it, and what it contained.
+///
+/// Without a network timestamp there is nothing stable to key on, so the
+/// object path is used after all - storing a message twice is better than
+/// dropping a genuinely new one.
+fn incoming_sms_id(path: &OwnedObjectPath, info: &SmsInfo, peer: &str) -> String {
+    let mut content = info.text.clone().into_bytes();
+    content.extend_from_slice(&info.data);
+    let digest = crate::sip::auth::md5_hex(&content);
+    match info.timestamp.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(ts) => format!("{ts}|{peer}|{digest}"),
+        None => format!("{}|{peer}|{digest}", path.as_str()),
+    }
 }
 
 /// Keep digits and the few characters that are meaningful for dialling.

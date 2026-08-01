@@ -217,6 +217,29 @@ impl Db {
                     return Ok(None);
                 }
             }
+
+            // Belt and braces for received messages: the same one is offered
+            // again whenever the modem restarts, and an identifier built the
+            // old way (or by a future version) will not match.  What the
+            // network said about a message does not change, so compare that.
+            if msg.direction == Direction::Incoming {
+                if let Some(ts) = msg.timestamp.as_deref().filter(|t| !t.is_empty()) {
+                    let existing: Option<i64> = conn
+                        .query_row(
+                            "SELECT id FROM messages
+                              WHERE kind = ?1 AND direction = ?2 AND peer = ?3
+                                AND timestamp = ?4
+                                AND IFNULL(text, '') = IFNULL(?5, '')",
+                            params![msg.kind, msg.direction.as_str(), msg.peer, ts, msg.text],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if existing.is_some() {
+                        return Ok(None);
+                    }
+                }
+            }
+
             conn.execute(
                 "INSERT INTO messages
                    (kind, direction, peer, own_number, subject, text, timestamp,
@@ -518,5 +541,96 @@ fn ext_for(content_type: &str) -> &'static str {
         "video/3gpp" => ".3gp",
         "application/smil" => ".smil",
         _ => ".bin",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn temp_db(name: &str) -> Db {
+        let dir = std::env::temp_dir()
+            .join(format!("modem2sip-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Db::open(&dir.join("test.db"), &dir.join("attachments")).await.unwrap()
+    }
+
+    fn received(peer: &str, text: &str, timestamp: &str, external_id: &str) -> NewMessage {
+        NewMessage {
+            kind: "sms",
+            direction: Direction::Incoming,
+            peer: peer.into(),
+            own_number: None,
+            subject: None,
+            text: Some(text.into()),
+            timestamp: Some(timestamp.into()),
+            status: "received".into(),
+            external_id: Some(external_id.into()),
+            raw: None,
+        }
+    }
+
+    /// A message the modem still holds is announced again after every
+    /// restart, and ModemManager renumbers its objects while doing so.  The
+    /// row must not come back twice, whatever the object path says.
+    #[tokio::test]
+    async fn a_message_re_announced_under_a_new_path_is_stored_once() {
+        let db = temp_db("readopt").await;
+        let first = db
+            .insert_message(received("01012345678", "hello", "2026-07-31T15:24:46+09", "/SMS/4|x"))
+            .await
+            .unwrap();
+        assert!(first.is_some());
+
+        // Same message, new object path - and therefore a different key.
+        let second = db
+            .insert_message(received("01012345678", "hello", "2026-07-31T15:24:46+09", "/SMS/11|x"))
+            .await
+            .unwrap();
+        assert_eq!(second, None, "the same message was stored twice");
+        assert_eq!(db.list_messages(10, None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn different_messages_are_all_kept() {
+        let db = temp_db("distinct").await;
+        // Same second, same sender, different text.
+        db.insert_message(received("01012345678", "one", "2026-07-31T15:24:46+09", "a"))
+            .await
+            .unwrap()
+            .unwrap();
+        db.insert_message(received("01012345678", "two", "2026-07-31T15:24:46+09", "b"))
+            .await
+            .unwrap()
+            .unwrap();
+        // Same text, different sender.
+        db.insert_message(received("01087654321", "one", "2026-07-31T15:24:46+09", "c"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.list_messages(10, None).await.unwrap().len(), 3);
+    }
+
+    /// Sending the same text twice is a normal thing to do, and those rows
+    /// carry no network timestamp to compare.
+    #[tokio::test]
+    async fn repeated_outgoing_messages_are_not_collapsed() {
+        let db = temp_db("outgoing").await;
+        for id in ["/SMS/1|t1", "/SMS/2|t2"] {
+            let msg = NewMessage {
+                kind: "sms",
+                direction: Direction::Outgoing,
+                peer: "01012345678".into(),
+                own_number: None,
+                subject: None,
+                text: Some("on my way".into()),
+                timestamp: None,
+                status: "sent".into(),
+                external_id: Some(id.into()),
+                raw: None,
+            };
+            assert!(db.insert_message(msg).await.unwrap().is_some());
+        }
+        assert_eq!(db.list_messages(10, None).await.unwrap().len(), 2);
     }
 }
