@@ -1717,7 +1717,7 @@ impl Gateway {
         }
 
         if self.shared.cfg.sms.delete_from_modem {
-            delete_from_modem(&modem, &path, &info).await;
+            delete_from_modem(modem.clone(), path.clone());
         }
         Ok(())
     }
@@ -1747,7 +1747,7 @@ impl Gateway {
                 Err(e) => warn!(error = %format!("{e:#}"), "handling the MMS notification failed"),
             }
             if delete {
-                delete_from_modem(&modem, &path, &info).await;
+                delete_from_modem(modem.clone(), path.clone());
             }
         });
         Ok(())
@@ -2139,30 +2139,46 @@ fn incoming_sms_id(path: &OwnedObjectPath, info: &SmsInfo, peer: &str) -> String
     }
 }
 
-/// Remove a handled message from the modem, if it is there to be removed.
+/// Remove a handled message from the modem, retrying for a while.
 ///
-/// A message can be handed to the host without ever being written to the SIM
-/// or the modem - WAP pushes carrying MMS notifications often are - and then
-/// there is nothing to delete.  ModemManager skips such parts silently but
-/// still logs a warning if the modem refuses a part it does believe is
-/// stored, which reads like a fault in the MMS itself; it is not, so say
-/// what actually happened on our side too.
-async fn delete_from_modem(modem: &Arc<ModemHandle>, path: &OwnedObjectPath, info: &SmsInfo) {
-    if info.storage == 0 {
+/// Asking the instant the message has been dealt with can be refused - "
+/// Couldn't delete 1 parts from this SMS" - while the very same request
+/// succeeds by hand a moment later, so the modem evidently needs time to
+/// settle a message it has just delivered.  Retrying costs nothing and the
+/// alternative is that its storage slowly fills with messages already
+/// handled.
+///
+/// Runs detached: the gateway must not wait on this, and neither must the
+/// MMS retrieval that follows a push.
+fn delete_from_modem(modem: Arc<ModemHandle>, path: OwnedObjectPath) {
+    tokio::spawn(async move {
+        // Spread out: the modem may need a good while after delivering a
+        // message before it will let go of it.
+        const RETRY_AFTER: [u64; 4] = [3, 10, 30, 120];
+        let mut last: Option<String> = None;
+
+        for (attempt, wait) in std::iter::once(0)
+            .chain(RETRY_AFTER.iter().copied())
+            .enumerate()
+        {
+            if wait > 0 {
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+            }
+            match modem.delete_sms(&path).await {
+                Ok(()) => {
+                    debug!(path = path.as_str(), attempt, "deleted from the modem");
+                    return;
+                }
+                Err(e) => last = Some(format!("{e:#}")),
+            }
+        }
+
         debug!(
             path = path.as_str(),
-            "message was never stored on the modem, nothing to delete"
+            error = last.unwrap_or_default(),
+            "the modem would not delete the message; it stays in its storage"
         );
-        return;
-    }
-    if let Err(e) = modem.delete_sms(path).await {
-        debug!(
-            path = path.as_str(),
-            storage = info.storage,
-            error = %format!("{e:#}"),
-            "the modem refused to delete the message; it stays in its storage"
-        );
-    }
+    });
 }
 
 /// Address something arriving from the mobile side to the line it arrived on.
