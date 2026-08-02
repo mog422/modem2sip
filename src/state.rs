@@ -14,6 +14,10 @@ pub struct Shared {
     pub cfg: Arc<Config>,
     pub db: Db,
     pub mms: Arc<MmsManager>,
+    /// The SIP element, once it exists.  Lets anything holding [`Shared`]
+    /// tell a peer about something - the HTTP API announcing an MMS it has
+    /// just fetched, for instance.
+    sip: RwLock<Option<Arc<crate::sip::SipCore>>>,
     /// `Some` while the configured modem is present and usable.
     modem: RwLock<Option<Arc<ModemHandle>>>,
     /// Cheap, lock-free view of the above for the SIP fast path (503s).
@@ -26,9 +30,18 @@ impl Shared {
             cfg,
             db,
             mms,
+            sip: RwLock::new(None),
             modem: RwLock::new(None),
             modem_ready: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub async fn set_sip(&self, core: Arc<crate::sip::SipCore>) {
+        *self.sip.write().await = Some(core);
+    }
+
+    pub async fn sip(&self) -> Option<Arc<crate::sip::SipCore>> {
+        self.sip.read().await.clone()
     }
 
     pub async fn set_modem(&self, handle: Option<Arc<ModemHandle>>) {

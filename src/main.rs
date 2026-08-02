@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
     let (modem_tx, modem_rx) = mpsc::channel(64);
 
     let core = sip::SipCore::new(cfg.clone(), sip_tx, shared.modem_ready.clone()).await?;
+    shared.set_sip(core.clone()).await;
 
     let mut tasks = Vec::new();
     tasks.push(tokio::spawn({

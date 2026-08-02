@@ -1888,7 +1888,13 @@ pub fn format_mms_summary(shared: &Arc<Shared>, msg: &StoredMessage) -> String {
         }
     }
     if msg.status != "received" {
-        out.push_str(&format!("\n(status: {})\n", msg.status));
+        // Say what is missing and how to ask for it again, rather than
+        // leaving a status word for the reader to interpret.
+        out.push_str(&format!(
+            "\n-- the message itself has not been fetched ({}) --\n\
+             retry with:  POST {}/messages/{}/retrieve\n",
+            msg.status, base, msg.id
+        ));
     }
     out
 }

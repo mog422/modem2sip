@@ -341,9 +341,22 @@ install -Dm644 systemd/modem2sip-mms-bearer@.service /etc/systemd/system/
 systemctl enable --now modem2sip-mms-bearer@lte.ktfwing.com.service   # instance = APN
 ```
 
-`POST /messages/{id}/retrieve` re-runs a download that never happened —
-useful for notifications that arrived while MMS was disabled or while the
-bearer was down.
+A notification whose body could not be fetched — MMS disabled, the bearer
+down, the MMSC refusing — is still announced over SIP, saying so and how to
+ask again:
+
+```
+[MMS] from 01012345678
+Subject: retry flow
+
+-- the message itself has not been fetched (retrieve_failed) --
+retry with:  POST http://192.168.1.1:8088/messages/85/retrieve
+```
+
+`POST /messages/{id}/retrieve` re-runs the download. It answers `502` with
+the reason if it fails again, and on success stores the parts and sends the
+peer the full summary it was promised. Retrying a message that did arrive is
+harmless: each part replaces the one with the same index.
 
 #### What real carrier traffic taught us
 
