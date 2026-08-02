@@ -265,6 +265,14 @@ interface and is unaffected.
 
 ### SMS
 
+Messages the gateway has dealt with are removed from the modem
+(`[sms] delete_from_modem`), including the ones it sent itself — ModemManager
+keeps an object for every message put on the air, and they otherwise pile up.
+Anything still there when the gateway starts is cleaned up as it re-reads the
+modem's storage, so a delete that failed while it was down is not lost.
+Messages are left alone when `delivery_report` is on, since the report needs
+something to match against.
+
 Deleting a handled message is retried for a couple of minutes. A modem can
 refuse the request the instant it has delivered something — ModemManager
 reports "Couldn't delete N parts from this SMS" — while the very same

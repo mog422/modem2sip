@@ -1009,6 +1009,11 @@ impl Gateway {
                     if let Err(e) = stored {
                         warn!(error = %format!("{e:#}"), "the SMS went out but could not be recorded");
                     }
+                    // The message is on its way and recorded; the modem does
+                    // not need to keep holding it.
+                    if shared.cfg.sms.delete_from_modem && !shared.cfg.sms.delivery_report {
+                        delete_from_modem(modem.clone(), path.clone());
+                    }
                     202
                 }
                 Err(e) => {
@@ -1665,6 +1670,20 @@ impl Gateway {
             return Ok(());
         }
         if !is_incoming || !is_ready {
+            // Messages we sent are ours to tidy up.  ModemManager keeps the
+            // object once the message is on its way, and one is left behind
+            // for every message sent, so they pile up for as long as the
+            // modem stays put.  Delivery reports need the object to match
+            // them against, so leave it alone when those are in use.
+            if info.pdu_type == sms_state::PDU_SUBMIT
+                && info.state == sms_state::STATE_SENT
+                && self.shared.cfg.sms.delete_from_modem
+                && !self.shared.cfg.sms.delivery_report
+            {
+                debug!(path = path.as_str(), "tidying up a message we sent");
+                delete_from_modem(modem.clone(), path.clone());
+                return Ok(());
+            }
             debug!(
                 path = path.as_str(),
                 state = info.state,
@@ -2150,7 +2169,7 @@ fn incoming_sms_id(path: &OwnedObjectPath, info: &SmsInfo, peer: &str) -> String
 ///
 /// Runs detached: the gateway must not wait on this, and neither must the
 /// MMS retrieval that follows a push.
-fn delete_from_modem(modem: Arc<ModemHandle>, path: OwnedObjectPath) {
+pub(crate) fn delete_from_modem(modem: Arc<ModemHandle>, path: OwnedObjectPath) {
     tokio::spawn(async move {
         // Spread out: the modem may need a good while after delivering a
         // message before it will let go of it.

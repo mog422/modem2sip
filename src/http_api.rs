@@ -269,6 +269,10 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                         .await
                         .ok()
                         .flatten();
+                    // Recorded and on its way; the modem need not keep it.
+                    if shared.cfg.sms.delete_from_modem && !shared.cfg.sms.delivery_report {
+                        crate::gateway::delete_from_modem(modem.clone(), path.clone());
+                    }
                     respond_json(&mut stream, 202, &json!({"status": "sent", "id": id})).await
                 }
                 Err(e) => respond_json(&mut stream, 500, &json!({"error": e.to_string()})).await,
