@@ -3,3 +3,8 @@
 *.db
 *.db-wal
 *.db-shm
+
+# editor leftovers
+*.swp
+*.swo
+*~
