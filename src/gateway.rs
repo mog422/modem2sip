@@ -1717,9 +1717,7 @@ impl Gateway {
         }
 
         if self.shared.cfg.sms.delete_from_modem {
-            if let Err(e) = modem.delete_sms(&path).await {
-                debug!(error = %format!("{e:#}"), "could not delete the SMS from the modem");
-            }
+            delete_from_modem(&modem, &path, &info).await;
         }
         Ok(())
     }
@@ -1749,7 +1747,7 @@ impl Gateway {
                 Err(e) => warn!(error = %format!("{e:#}"), "handling the MMS notification failed"),
             }
             if delete {
-                let _ = modem.delete_sms(&path).await;
+                delete_from_modem(&modem, &path, &info).await;
             }
         });
         Ok(())
@@ -2138,6 +2136,32 @@ fn incoming_sms_id(path: &OwnedObjectPath, info: &SmsInfo, peer: &str) -> String
     match info.timestamp.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         Some(ts) => format!("{ts}|{peer}|{digest}"),
         None => format!("{}|{peer}|{digest}", path.as_str()),
+    }
+}
+
+/// Remove a handled message from the modem, if it is there to be removed.
+///
+/// A message can be handed to the host without ever being written to the SIM
+/// or the modem - WAP pushes carrying MMS notifications often are - and then
+/// there is nothing to delete.  ModemManager skips such parts silently but
+/// still logs a warning if the modem refuses a part it does believe is
+/// stored, which reads like a fault in the MMS itself; it is not, so say
+/// what actually happened on our side too.
+async fn delete_from_modem(modem: &Arc<ModemHandle>, path: &OwnedObjectPath, info: &SmsInfo) {
+    if info.storage == 0 {
+        debug!(
+            path = path.as_str(),
+            "message was never stored on the modem, nothing to delete"
+        );
+        return;
+    }
+    if let Err(e) = modem.delete_sms(path).await {
+        debug!(
+            path = path.as_str(),
+            storage = info.storage,
+            error = %format!("{e:#}"),
+            "the modem refused to delete the message; it stays in its storage"
+        );
     }
 }
 

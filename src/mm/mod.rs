@@ -80,6 +80,10 @@ pub struct CallInfo {
 pub struct SmsInfo {
     pub state: u32,
     pub pdu_type: u32,
+    /// MMSmsStorage: 0 when the message was handed straight to the host and
+    /// never written to the SIM or the modem, in which case there is nothing
+    /// to delete afterwards.
+    pub storage: u32,
     pub number: String,
     pub text: String,
     pub data: Vec<u8>,
@@ -223,6 +227,7 @@ impl ModemHandle {
         Ok(SmsInfo {
             state: sms.state().await.unwrap_or(sms_state::STATE_UNKNOWN),
             pdu_type: sms.pdu_type().await.unwrap_or(sms_state::PDU_UNKNOWN),
+            storage: sms.storage().await.unwrap_or(0),
             number: sms.number().await.unwrap_or_default(),
             text: sms.text().await.unwrap_or_default(),
             data: sms.data().await.unwrap_or_default(),

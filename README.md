@@ -265,6 +265,12 @@ interface and is unaffected.
 
 ### SMS
 
+A message that was handed straight to the host without being written to the
+SIM or the modem — WAP pushes carrying MMS notifications often are — is not
+deleted afterwards, because there is nothing there to delete. If the modem
+refuses to delete one it does hold, that is logged at debug and the message
+is left where it is; ModemManager logs its own warning for the same event.
+
 Incoming messages are stored in SQLite and forwarded as a SIP `MESSAGE`
 (`text/plain`) whose `From` user part is the sender's number. They are deleted
 from the modem/SIM only after the database write succeeds.
