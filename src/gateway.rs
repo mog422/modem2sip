@@ -1892,7 +1892,7 @@ pub fn format_mms_summary(shared: &Arc<Shared>, msg: &StoredMessage) -> String {
         // leaving a status word for the reader to interpret.
         out.push_str(&format!(
             "\n-- the message itself has not been fetched ({}) --\n\
-             retry with:  POST {}/messages/{}/retrieve\n",
+             fetch it:  {}/messages/{}/retrieve\n",
             msg.status, base, msg.id
         ));
     }

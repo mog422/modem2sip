@@ -350,13 +350,17 @@ ask again:
 Subject: retry flow
 
 -- the message itself has not been fetched (retrieve_failed) --
-retry with:  POST http://192.168.1.1:8088/messages/85/retrieve
+fetch it:  http://192.168.1.1:8088/messages/85/retrieve
 ```
 
-`POST /messages/{id}/retrieve` re-runs the download. It answers `502` with
+That link re-runs the download — `GET` as well as `POST`, so tapping it on
+the phone that received the notification is enough. It answers `502` with
 the reason if it fails again, and on success stores the parts and sends the
 peer the full summary it was promised. Retrying a message that did arrive is
 harmless: each part replaces the one with the same index.
+
+A browser gets a small page with the message and links to its attachments;
+anything else gets JSON.
 
 #### What real carrier traffic taught us
 
@@ -388,6 +392,7 @@ Tested against KT (`http://mmsc.ktfwing.com:9082`):
 | GET    | `/messages?limit=&before=`             | stored SMS/MMS, newest first         |
 | GET    | `/messages/{id}`                       | one message with its attachments     |
 | GET    | `/messages/{id}/attachments/{index}`   | attachment download                  |
+| GET/POST | `/messages/{id}/retrieve`              | fetch an MMS body that is still missing |
 | POST   | `/sms`                                 | `{"to","text"}`                      |
 | POST   | `/mms`                                 | see above                            |
 

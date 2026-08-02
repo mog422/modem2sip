@@ -281,7 +281,11 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
 
         // Retry a notification that was never downloaded (MMS disabled at the
         // time, bearer down, MMSC error).
-        ("POST", ["messages", id, "retrieve"]) => {
+        // GET as well as POST: the retry link travels to the operator inside
+        // a text message, and tapping it on a phone is a GET.  Fetching an
+        // MMS again is idempotent - each part replaces the one with the same
+        // index - so there is nothing here that a second visit would spoil.
+        ("POST", ["messages", id, "retrieve"]) | ("GET", ["messages", id, "retrieve"]) => {
             let Ok(id) = id.parse::<i64>() else {
                 return respond_json(&mut stream, 400, &json!({"error": "bad id"})).await;
             };
@@ -304,11 +308,33 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                             .await;
                         });
                     }
-                    respond_json(&mut stream, 200, &json!({"status": "retrieved", "message": msg}))
+                    if wants_html(&req) {
+                        respond_html(&mut stream, 200, &retrieved_page(&shared, msg.as_ref()))
+                            .await
+                    } else {
+                        respond_json(
+                            &mut stream,
+                            200,
+                            &json!({"status": "retrieved", "message": msg}),
+                        )
                         .await
+                    }
                 }
                 Err(e) => {
-                    respond_json(&mut stream, 502, &json!({"error": format!("{e:#}")})).await
+                    let reason = format!("{e:#}");
+                    if wants_html(&req) {
+                        respond_html(
+                            &mut stream,
+                            502,
+                            &format!(
+                                "<h2>Could not fetch it</h2><p>{}</p>",
+                                escape_html(&reason)
+                            ),
+                        )
+                        .await
+                    } else {
+                        respond_json(&mut stream, 502, &json!({"error": reason})).await
+                    }
                 }
             }
         }
@@ -385,6 +411,57 @@ async fn read_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>> {
     body.truncate(content_length);
 
     Ok(Some(HttpRequest { method, path, query, headers, body }))
+}
+
+/// A browser asked, rather than a script.
+fn wants_html(req: &HttpRequest) -> bool {
+    req.header("accept").map(|a| a.contains("text/html")).unwrap_or(false)
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// What a phone shows after following the retry link.
+fn retrieved_page(shared: &Arc<Shared>, msg: Option<&crate::db::StoredMessage>) -> String {
+    let Some(msg) = msg else {
+        return "<h2>Fetched</h2>".to_string();
+    };
+    let base = shared.http_base_url();
+    let mut out = String::from("<h2>Fetched</h2>");
+    out.push_str(&format!("<p>From {}", escape_html(&msg.peer)));
+    if let Some(subject) = msg.subject.as_deref().filter(|s| !s.is_empty()) {
+        out.push_str(&format!("<br>{}", escape_html(subject)));
+    }
+    out.push_str("</p>");
+    if let Some(text) = msg.text.as_deref().filter(|t| !t.is_empty()) {
+        out.push_str(&format!("<p>{}</p>", escape_html(text)));
+    }
+    if !msg.attachments.is_empty() {
+        out.push_str("<ul>");
+        for att in &msg.attachments {
+            out.push_str(&format!(
+                "<li><a href=\"{}/messages/{}/attachments/{}\">{}</a> ({})</li>",
+                base,
+                msg.id,
+                att.index,
+                escape_html(att.name.as_deref().unwrap_or("part")),
+                escape_html(&att.content_type)
+            ));
+        }
+        out.push_str("</ul>");
+    }
+    out
+}
+
+async fn respond_html(stream: &mut TcpStream, status: u16, body: &str) -> Result<()> {
+    let page = format!(
+        "<!doctype html><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>modem2sip</title>\
+         <body style=\"font:16px/1.5 system-ui,sans-serif;margin:2rem;max-width:40rem\">{body}"
+    );
+    respond_bytes(stream, status, "text/html; charset=utf-8", page.into_bytes()).await
 }
 
 async fn respond_json(
