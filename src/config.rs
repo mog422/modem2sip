@@ -67,10 +67,12 @@ pub struct ModemMatch {
     /// Own MSISDN, overriding whatever the SIM reports.  Used to address
     /// calls and messages arriving from the mobile side.
     pub own_number: Option<String>,
-    /// Country code of this line, without `+` (e.g. "82").  SIMs report the
-    /// own number in international format, and a national one is usually what
-    /// people expect to see: with this set, `821012345678` is rendered as
-    /// `01012345678`.  Unset means the number is used exactly as reported.
+    /// Country code of this line, with or without `+` (e.g. "82" or "+82").
+    /// Numbers coming off the air are in international format, and a national
+    /// one is usually what people expect to see: with this set, both
+    /// `821012345678` and `+821012345678` are rendered as `01012345678`.
+    /// Applies to this line's own number and to whoever is calling or
+    /// writing.  Unset means numbers are used exactly as reported.
     pub country_code: Option<String>,
     /// Trunk prefix that replaces the country code.  "0" nearly everywhere;
     /// set it empty for the North American plan, which has none.

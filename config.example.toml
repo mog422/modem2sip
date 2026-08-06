@@ -23,7 +23,7 @@ enable = true                       # enable the modem if MM reports it disabled
 # SIMs report the own number in international format.  With the country code
 # set it is rendered nationally instead - 821012345678 becomes 01012345678 -
 # which is how it appears in the To header of incoming calls and messages.
-# country_code    = "82"
+# country_code    = "82"              # or "+82"; also applied to the far end
 # national_prefix = "0"             # empty for the North American plan
 # Optional: any other vendor setup ModemManager cannot do.  Runs on every
 # modem-ready event with M2S_AT_PORT, M2S_ALSA_DEVICE, M2S_DEVICE, ... set.

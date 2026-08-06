@@ -133,10 +133,13 @@ impl MmsManager {
             );
         }
 
-        let peer = notification
-            .sender()
-            .or_else(|| Some(sms.number.clone()))
-            .unwrap_or_default();
+        // Whoever sent it, written the way this line's country writes it:
+        // the MMSC gives the sender in international form, and it is what a
+        // SIP client will reply to.
+        let peer = crate::state::local_number(
+            &self.cfg,
+            &notification.sender().or_else(|| Some(sms.number.clone())).unwrap_or_default(),
+        );
         let tid = notification.transaction_id.clone();
         let external_id = tid.clone().or_else(|| notification.message_id.clone());
 

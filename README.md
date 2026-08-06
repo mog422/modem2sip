@@ -146,12 +146,17 @@ The request still travels to the target's address — only the user part is
 rewritten, and any parameters the target carries are kept.
 
 The number is `[modem] own_number` when set, otherwise the one the SIM
-reports; without either, the target address is left as it is. SIMs report it
-in international format, so `[modem] country_code` renders it the way it is
-written locally — with `country_code = "82"`, `821012345678` becomes
-`01012345678`, which is also the form the network uses for the sender in
-`From`. `national_prefix` defaults to `0`; leave it empty for the North
-American plan.
+reports; without either, the target address is left as it is. It arrives in
+international format, so `[modem] country_code` renders it the way it is
+written locally — with `country_code = "82"` (`"+82"` reads the same),
+`821012345678` and `+821012345678` both become `01012345678`.
+`national_prefix` defaults to `0`; leave it empty for the North American
+plan.
+
+The same applies to whoever is at the other end: the caller of an incoming
+call and the sender of a message are rendered the same way, in the `From`
+they arrive under and in the database, so a SIP client can call or reply
+straight back. Numbers dialled from the SIP side are passed on untouched.
 * Only one call at a time (one modem, one audio card): further `INVITE`s get
   `486 Busy Here`.
 * DTMF: SIP `INFO` (`application/dtmf-relay`) and RFC 2833 both map to

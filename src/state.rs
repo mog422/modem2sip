@@ -80,11 +80,17 @@ impl Shared {
                 .and_then(|m| m.info.own_number.clone())
                 .filter(|n| !n.trim().is_empty()),
         }?;
-        Some(to_national(
-            &number,
-            self.cfg.modem.country_code.as_deref(),
-            &self.cfg.modem.national_prefix,
-        ))
+        Some(self.local_number(&number))
+    }
+
+    /// A number as it is written where this line lives.
+    ///
+    /// Everything arriving from the mobile side goes through here - the
+    /// caller of an incoming call, the sender of a message - so a SIP client
+    /// sees `01012345678` rather than the international form the network
+    /// uses, and can call or reply straight back.
+    pub fn local_number(&self, number: &str) -> String {
+        local_number(&self.cfg, number)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -101,6 +107,12 @@ impl Shared {
     }
 }
 
+/// [`Shared::local_number`] for anything that holds the config but not the
+/// shared state.
+pub fn local_number(cfg: &Config, number: &str) -> String {
+    to_national(number, cfg.modem.country_code.as_deref(), &cfg.modem.national_prefix)
+}
+
 /// Render a number the way people in that country write it.
 ///
 /// SIMs report the own number in international format (`821012345678`), which
@@ -110,7 +122,13 @@ impl Shared {
 /// trunk prefix; without it the number is left exactly as it came.
 pub fn to_national(number: &str, country_code: Option<&str>, national_prefix: &str) -> String {
     let number = number.trim();
-    let Some(cc) = country_code.map(str::trim).filter(|c| !c.is_empty()) else {
+    // Written either way round in the config - "82" or "+82" - and either way
+    // round on the wire, since a network may or may not put the plus there.
+    let Some(cc) = country_code
+        .map(str::trim)
+        .map(|c| c.strip_prefix('+').unwrap_or(c))
+        .filter(|c| !c.is_empty())
+    else {
         return number.to_string();
     };
     let digits = number.strip_prefix('+').unwrap_or(number);
@@ -133,6 +151,25 @@ mod tests {
         // Already national, or from somewhere else: left alone.
         assert_eq!(to_national("01012345678", Some("82"), "0"), "01012345678");
         assert_eq!(to_national("+4915112345678", Some("82"), "0"), "+4915112345678");
+    }
+
+    #[test]
+    fn the_country_code_may_carry_a_plus() {
+        // Config and wire, in every combination.
+        assert_eq!(to_national("821012345678", Some("+82"), "0"), "01012345678");
+        assert_eq!(to_national("+821012345678", Some("+82"), "0"), "01012345678");
+        assert_eq!(to_national("+821012345678", Some("82"), "0"), "01012345678");
+        assert_eq!(to_national("821012345678", Some("82"), "0"), "01012345678");
+    }
+
+    #[test]
+    fn a_number_already_written_locally_is_left_alone() {
+        // Applied twice over - a peer normalised on the way in and again on
+        // the way out to SIP - must not shed another prefix.
+        let once = to_national("+821012345678", Some("+82"), "0");
+        assert_eq!(to_national(&once, Some("+82"), "0"), once);
+        // Nor may a short code be mistaken for an international number.
+        assert_eq!(to_national("106", Some("82"), "0"), "106");
     }
 
     #[test]

@@ -303,7 +303,7 @@ impl Gateway {
             self.shared.cfg.audio.period_ms,
         );
 
-        let caller = sanitize_number(&info.number);
+        let caller = self.shared.local_number(&sanitize_number(&info.number));
         let domain = self.core.domain();
         let from_user = if caller.is_empty() { "anonymous".to_string() } else { caller.clone() };
         let local_tag = crate::sip::auth::random_hex(6);
@@ -1706,7 +1706,7 @@ impl Gateway {
         path: OwnedObjectPath,
         info: SmsInfo,
     ) -> Result<()> {
-        let peer = sanitize_number(&info.number);
+        let peer = self.shared.local_number(&sanitize_number(&info.number));
 
         let stored = self
             .shared
@@ -1750,7 +1750,7 @@ impl Gateway {
         let shared = self.shared.clone();
         let core = self.core.clone();
         let delete = self.shared.cfg.sms.delete_from_modem;
-        let peer_fallback = sanitize_number(&info.number);
+        let peer_fallback = self.shared.local_number(&sanitize_number(&info.number));
 
         // Retrieval talks to the MMSC over HTTP: never block the gateway.
         tokio::spawn(async move {
