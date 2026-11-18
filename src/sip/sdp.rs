@@ -143,7 +143,15 @@ impl Sdp {
                     if let Some(rest) = attr.strip_prefix("rtpmap:") {
                         let mut it = rest.split_whitespace();
                         if let (Some(pt), Some(enc)) = (it.next(), it.next()) {
-                            if enc.to_ascii_lowercase().starts_with("telephone-event") {
+                            // Only the 8 kHz one, and only the first of
+                            // those.  A wide-band phone offers one
+                            // telephone-event per clock rate it speaks
+                            // (`101 telephone-event/48000`, `96
+                            // telephone-event/8000`), and taking whichever
+                            // came last had the answer call a 48 kHz payload
+                            // type "telephone-event/8000" - after which the
+                            // digits arrived under a number nobody decoded.
+                            if telephone_event.is_none() && is_narrowband_telephone_event(enc) {
                                 telephone_event = pt.parse::<u8>().ok();
                             }
                         }
@@ -259,6 +267,14 @@ impl std::fmt::Display for Sdp {
     }
 }
 
+/// `telephone-event/8000`, the only DTMF payload that goes with G.711.
+fn is_narrowband_telephone_event(encoding: &str) -> bool {
+    let mut parts = encoding.split('/');
+    let name = parts.next().unwrap_or("");
+    let rate = parts.next().unwrap_or("");
+    name.eq_ignore_ascii_case("telephone-event") && rate.trim() == "8000"
+}
+
 fn parse_ip(s: &str) -> Option<IpAddr> {
     // Strip any TTL/multicast suffix ("224.0.0.1/127").
     s.split('/').next()?.parse().ok()
@@ -306,6 +322,32 @@ mod tests {
             offer.answer("10.0.0.1".parse().unwrap(), 16000, Codec::Pcmu, None, 20).telephone_event,
             None
         );
+    }
+
+    /// A wide-band softphone lists a telephone-event per clock rate.  The
+    /// one that belongs with G.711 is the 8 kHz one, wherever it appears in
+    /// the list.
+    #[test]
+    fn only_the_8khz_telephone_event_is_taken() {
+        let offer = |lines: &str| {
+            Sdp::parse(&format!(
+                "v=0\r\nc=IN IP4 10.0.0.5\r\nm=audio 40000 RTP/AVP 96 0 8 101 97\r\n\
+                 a=rtpmap:96 opus/48000/2\r\n{lines}"
+            ))
+            .unwrap()
+        };
+        // 8 kHz first, 48 kHz last: the last one used to win.
+        let sdp = offer("a=rtpmap:97 telephone-event/8000\r\na=rtpmap:101 telephone-event/48000\r\n");
+        assert_eq!(sdp.telephone_event, Some(97));
+        // And the other way round.
+        let sdp = offer("a=rtpmap:101 telephone-event/48000\r\na=rtpmap:97 Telephone-Event/8000\r\n");
+        assert_eq!(sdp.telephone_event, Some(97));
+        // Nothing at 8 kHz: no RFC 2833 on this call, rather than a payload
+        // type described with the wrong clock.
+        let sdp = offer("a=rtpmap:101 telephone-event/48000\r\n");
+        assert_eq!(sdp.telephone_event, None);
+        let answer = sdp.answer("10.0.0.1".parse().unwrap(), 16000, Codec::Pcmu, Some(101), 20);
+        assert!(!answer.to_string().contains("telephone-event"));
     }
 
     /// An answer mirrors the offer's direction, and a peer on hold has to be
