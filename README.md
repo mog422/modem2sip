@@ -551,6 +551,12 @@ The hardware rows above were measured before the transaction-layer, teardown
 and RTP-acceptance rework; only the test suite has been re-run since. Worth
 repeating on a modem before trusting them again.
 
+Likewise not yet seen on a modem: the client-side INVITE handling (repeated
+ACK, retransmitted CANCEL, an answer that crosses it - exercised against a
+socket in the test suite), RTP from a peer behind NAT, the held-message
+queue, and the voice-path check no longer reopening the AT port on every
+call.
+
 ## Limitations
 
 * **In-band DTMF is only as good as the vocoder.** When the modem refuses to
