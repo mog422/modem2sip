@@ -813,7 +813,7 @@ impl Gateway {
         if let (Some(o), Some(media)) = (offer.as_ref(), call.media.as_ref()) {
             let remote = SocketAddr::new(o.address, o.port);
             info!(%remote, "re-INVITE moved the remote media endpoint");
-            media.set_remote(remote);
+            media.set_remote(remote, src.ip());
         }
 
         let base = offer.clone().or_else(|| call.remote_sdp.clone());
@@ -1507,6 +1507,7 @@ impl Gateway {
         let sock = call.rtp_socket.take().ok_or_else(|| anyhow!("no RTP socket"))?;
         let dtmf_payload_type = call.remote_sdp.as_ref().and_then(|s| s.telephone_event);
         call.media_dtmf_pt = dtmf_payload_type;
+        let sip_peer = call.remote_addr.ip();
 
         let (dtmf_tx, mut dtmf_rx) = mpsc::channel::<char>(16);
         let (inband_tx, mut inband_rx) = mpsc::channel::<char>(16);
@@ -1521,6 +1522,7 @@ impl Gateway {
                 jitter_ms,
                 symmetric,
                 detect_inband_dtmf,
+                sip_peer: Some(sip_peer),
             },
             dtmf_tx,
             inband_tx,

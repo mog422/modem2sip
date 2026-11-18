@@ -433,9 +433,11 @@ plaintext UDP and the HTTP API has no TLS. What the gateway does enforce:
 * In-dialog `BYE` and `INFO` are matched on the Call-ID **and** both dialog
   tags, so knowing the Call-ID is not enough to hang up a call or inject
   digits into it.
-* RTP is only accepted from the address signalled in SDP. Symmetric RTP still
-  latches onto whatever port the peer sends from, which is what makes it work
-  behind NAT, but not onto a different host.
+* RTP is only accepted from the address signalled in SDP, or from the host
+  the call's SIP signalling comes from - which is where the audio of a phone
+  behind NAT arrives from, since its SDP names a private address. Symmetric
+  RTP latches onto whatever port that host sends from, but not onto a third
+  host.
 * `sip.allow` restricts which source addresses are answered at all.
 
 With `sip.auth` unset and `sip.allow` empty — the defaults — anyone who can

@@ -37,7 +37,24 @@ pub struct MediaSession {
 
 struct Signalled {
     addr: SocketAddr,
+    /// The host the SIP signalling for this call comes from.  A peer behind
+    /// NAT writes its private address into the SDP, so its audio never
+    /// arrives from `addr` - it arrives from the NAT's public address, which
+    /// is this one.
+    sip_peer: Option<IpAddr>,
     latched: bool,
+}
+
+impl Signalled {
+    /// May a packet from `source` be treated as the peer's audio?
+    ///
+    /// Only two hosts get to be heard: the one the SDP named, and the one
+    /// the signalling comes from.  The port is free to differ - that is what
+    /// lets RTP through a NAT - but an unrelated host must not be able to
+    /// take the call's audio over by getting a packet in first.
+    fn accepts(&self, source: IpAddr) -> bool {
+        self.addr.ip().is_unspecified() || source == self.addr.ip() || Some(source) == self.sip_peer
+    }
 }
 
 /// Milliseconds since the session started, for the inactivity check.  An
@@ -80,6 +97,9 @@ pub struct MediaConfig {
     /// all on modems whose DTMF handling the network rejects), so the tones
     /// are detected in the audio instead.
     pub detect_inband_dtmf: bool,
+    /// Where the SIP signalling for the call comes from; audio from there is
+    /// accepted even when the SDP names a different (private) address.
+    pub sip_peer: Option<IpAddr>,
 }
 
 impl MediaSession {
@@ -127,7 +147,11 @@ impl MediaSession {
         let payload_type = cfg.codec.payload_type();
         let rings = audio.rings.clone();
         let stop = Arc::new(AtomicBool::new(false));
-        let signalled = Arc::new(Mutex::new(Signalled { addr: remote, latched: false }));
+        let signalled = Arc::new(Mutex::new(Signalled {
+            addr: remote,
+            sip_peer: cfg.sip_peer,
+            latched: false,
+        }));
         let clock = Arc::new(Clock::new());
         let remote = Arc::new(Mutex::new(remote));
         let sock = Arc::new(sock);
@@ -193,18 +217,21 @@ impl MediaSession {
 
     /// Point the session at a new destination (re-INVITE / late SDP).
     ///
-    /// The receiver only accepts audio from the host the signalling named, so
-    /// a peer that re-homes its media has to move that expectation too - it
-    /// used to keep checking against the original address, and every packet
-    /// from the new one was dropped for the rest of the call.  Moving to a
-    /// different host also clears the symmetric-RTP latch, so the new
-    /// endpoint's own source port can be learned.
-    pub fn set_remote(&self, addr: SocketAddr) {
+    /// The receiver only accepts audio from the host the signalling named
+    /// (or came from), so a peer that re-homes its media has to move that
+    /// expectation too - it used to keep checking against the original
+    /// address, and every packet from the new one was dropped for the rest
+    /// of the call.
+    ///
+    /// The symmetric-RTP latch is cleared every time, not only when the host
+    /// changes: the address just signalled replaces whatever had been
+    /// learned from the packets, and for a peer behind NAT the signalled one
+    /// is the one that does not work.  The next packet teaches it again.
+    pub fn set_remote(&self, addr: SocketAddr, sip_peer: IpAddr) {
         let mut signalled = self.signalled.lock().unwrap();
-        if signalled.addr.ip() != addr.ip() {
-            signalled.latched = false;
-        }
+        signalled.latched = false;
         signalled.addr = addr;
+        signalled.sip_peer = Some(sip_peer);
         *self.remote.lock().unwrap() = addr;
     }
 
@@ -402,15 +429,11 @@ async fn receiver_loop(
             }
         };
 
-        // Only the host the signalling named gets to be heard.  The port is
-        // allowed to differ - that is what makes RTP work behind NAT - but a
-        // completely unrelated host must not be able to take over the call
-        // audio by winning a race with the peer's first packet.  Re-read on
-        // every packet: a re-INVITE may have moved the peer since the session
-        // started, and audio from where it moved to has to be accepted.
-        let expected = signalled.lock().unwrap().addr;
-        if !expected.ip().is_unspecified() && src.ip() != expected.ip() {
-            trace!(from = %src, %expected, "ignoring RTP from an unexpected host");
+        // Re-read on every packet: a re-INVITE may have moved the peer since
+        // the session started, and audio from where it moved to has to be
+        // accepted.
+        if !signalled.lock().unwrap().accepts(src.ip()) {
+            trace!(from = %src, "ignoring RTP from an unexpected host");
             continue;
         }
 
@@ -500,4 +523,34 @@ fn dtmf_char(event: u8) -> Option<char> {
         12..=15 => (b'A' + (event - 12)) as char,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signalled(sdp: &str, sip_peer: Option<&str>) -> Signalled {
+        Signalled {
+            addr: sdp.parse().unwrap(),
+            sip_peer: sip_peer.map(|p| p.parse().unwrap()),
+            latched: false,
+        }
+    }
+
+    /// A phone behind NAT signals its private address, and its audio arrives
+    /// from the NAT's public one - the address its SIP comes from.  Checking
+    /// only against the SDP dropped every packet of such a call.
+    #[test]
+    fn audio_from_the_signalling_host_is_accepted() {
+        let nat = signalled("192.168.1.20:40000", Some("203.0.113.9"));
+        assert!(nat.accepts("203.0.113.9".parse().unwrap()), "the NAT's public address");
+        assert!(nat.accepts("192.168.1.20".parse().unwrap()), "the address in the SDP");
+        // Still nobody else.
+        assert!(!nat.accepts("198.51.100.7".parse().unwrap()));
+
+        // Without a signalling address only the SDP counts.
+        let plain = signalled("10.0.0.5:40000", None);
+        assert!(plain.accepts("10.0.0.5".parse().unwrap()));
+        assert!(!plain.accepts("10.0.0.6".parse().unwrap()));
+    }
 }
