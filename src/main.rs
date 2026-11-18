@@ -14,6 +14,7 @@ mod http_api;
 mod media;
 mod mm;
 mod mms;
+mod outbox;
 mod sip;
 mod state;
 mod vendor;
@@ -97,7 +98,6 @@ async fn main() -> Result<()> {
     let (modem_tx, modem_rx) = mpsc::channel(64);
 
     let core = sip::SipCore::new(cfg.clone(), sip_tx, shared.modem_ready.clone()).await?;
-    shared.set_sip(core.clone()).await;
 
     let mut tasks = Vec::new();
     tasks.push(tokio::spawn({
@@ -116,6 +116,7 @@ async fn main() -> Result<()> {
         let cfg = cfg.clone();
         async move { mm::watcher::run(cfg, modem_tx).await }
     }));
+    tasks.push(tokio::spawn(outbox::run(shared.clone(), core.clone())));
     tasks.push(tokio::spawn({
         let shared = shared.clone();
         async move {

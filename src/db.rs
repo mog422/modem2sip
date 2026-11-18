@@ -94,7 +94,8 @@ CREATE TABLE IF NOT EXISTS messages (
     status       TEXT NOT NULL,
     external_id  TEXT,
     error        TEXT,
-    raw          BLOB
+    raw          BLOB,
+    sip_pending  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_messages_peer ON messages(peer);
 CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received_at);
@@ -152,6 +153,7 @@ impl Db {
             let conn = Connection::open(&path)
                 .with_context(|| format!("opening sqlite db {}", path.display()))?;
             conn.execute_batch(SCHEMA).context("applying schema")?;
+            migrate(&conn).context("upgrading the schema")?;
             Ok(conn)
         })
         .await??;
@@ -173,6 +175,42 @@ impl Db {
             f(&mut guard)
         })
         .await?
+    }
+
+    /// Mark a message as owed to the SIP side, or as settled.
+    pub async fn set_sip_pending(&self, id: i64, pending: bool) -> Result<()> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE messages SET sip_pending = ?1 WHERE id = ?2",
+                params![pending as i64, id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Messages still owed to the SIP side, oldest first.
+    pub async fn sip_pending(&self, limit: i64) -> Result<Vec<StoredMessage>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, direction, peer, own_number, subject, text, timestamp,
+                        received_at, status, external_id
+                 FROM messages
+                 WHERE sip_pending = 1
+                 ORDER BY id ASC LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![limit], row_to_message)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            let mut out = Vec::with_capacity(rows.len());
+            for mut m in rows {
+                m.attachments = load_attachments(conn, m.id)?;
+                out.push(m);
+            }
+            Ok(out)
+        })
+        .await
     }
 
     /// The row a previous copy of this message was stored as, with its status.
@@ -481,6 +519,27 @@ impl Db {
     }
 }
 
+/// Bring a database written by an older build up to the current schema.
+///
+/// `CREATE TABLE IF NOT EXISTS` leaves an existing table exactly as it is,
+/// so a column added since has to be added here.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let has_sip_pending = conn
+        .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'sip_pending'")?
+        .exists([])?;
+    if !has_sip_pending {
+        // Everything already stored was handled the old way - announced
+        // once, at the time - so none of it is owed to anyone now.
+        conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN sip_pending INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_messages_sip_pending
+             ON messages(id) WHERE sip_pending = 1",
+    )
+}
+
 fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
     Ok(StoredMessage {
         id: r.get(0)?,
@@ -675,6 +734,69 @@ mod tests {
         assert_eq!(std::fs::read(&att.path).unwrap(), b"jpeg");
         // The name the sender gave is still what the record says.
         assert_eq!(att.name.as_deref(), Some(name.as_str()));
+    }
+
+    /// What is owed to SIP comes back oldest first, and stops coming back
+    /// once it has been settled.
+    #[tokio::test]
+    async fn pending_messages_are_listed_in_order_until_settled() {
+        let db = temp_db("pending").await;
+        let mut ids = Vec::new();
+        for n in 0..3 {
+            let msg = received("01012345678", &format!("message {n}"), &format!("2026-07-31T15:24:4{n}+09"), &format!("p{n}"));
+            ids.push(db.insert_message(msg).await.unwrap().unwrap());
+        }
+        // Nothing is owed until someone says so.
+        assert!(db.sip_pending(10).await.unwrap().is_empty());
+
+        for id in [ids[2], ids[0], ids[1]] {
+            db.set_sip_pending(id, true).await.unwrap();
+        }
+        let listed: Vec<i64> = db.sip_pending(10).await.unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(listed, ids, "not in arrival order");
+        assert_eq!(db.sip_pending(2).await.unwrap().len(), 2);
+
+        db.set_sip_pending(ids[0], false).await.unwrap();
+        let listed: Vec<i64> = db.sip_pending(10).await.unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(listed, ids[1..]);
+    }
+
+    /// A database from before the column existed has to open, keep its
+    /// rows, and not suddenly owe SIP every message it ever stored.
+    #[tokio::test]
+    async fn a_database_from_an_older_build_is_upgraded_in_place() {
+        let dir = std::env::temp_dir()
+            .join(format!("modem2sip-test-{}-upgrade", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.db");
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE messages (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                     direction TEXT NOT NULL, peer TEXT NOT NULL, own_number TEXT,
+                     subject TEXT, text TEXT, timestamp TEXT, received_at TEXT NOT NULL,
+                     status TEXT NOT NULL, external_id TEXT, error TEXT, raw BLOB);
+                 INSERT INTO messages (kind, direction, peer, text, received_at, status)
+                     VALUES ('sms', 'incoming', '01012345678', 'from before', '2026-01-01T00:00:00+09:00', 'received');",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path, &dir.join("attachments")).await.unwrap();
+        let all = db.list_messages(10, None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].text.as_deref(), Some("from before"));
+        assert!(db.sip_pending(10).await.unwrap().is_empty(), "an old message became pending");
+
+        // The new column works on the upgraded table, and opening it a
+        // second time is not an error.
+        db.set_sip_pending(all[0].id, true).await.unwrap();
+        assert_eq!(db.sip_pending(10).await.unwrap().len(), 1);
+        drop(db);
+        let again = Db::open(&path, &dir.join("attachments")).await.unwrap();
+        assert_eq!(again.sip_pending(10).await.unwrap().len(), 1);
     }
 
     /// Sending the same text twice is a normal thing to do, and those rows

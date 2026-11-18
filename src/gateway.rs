@@ -1796,7 +1796,9 @@ impl Gateway {
             Some(id) => {
                 info!(id, from = %peer, chars = info.text.chars().count(), "SMS received");
                 if self.shared.cfg.sms.notify_sip {
-                    self.notify_sip(&peer, "text/plain", info.text.clone());
+                    // Not sent from here: the outbox delivers it, now if it
+                    // can and later if nobody is there to take it.
+                    self.shared.queue_for_sip(id).await;
                 }
             }
             None => debug!("duplicate SMS ignored"),
@@ -1815,20 +1817,14 @@ impl Gateway {
         info: SmsInfo,
     ) -> Result<()> {
         let shared = self.shared.clone();
-        let core = self.core.clone();
         let delete = self.shared.cfg.sms.delete_from_modem;
-        let peer_fallback = self.shared.local_number(&sanitize_number(&info.number));
 
         // Retrieval talks to the MMSC over HTTP: never block the gateway.
         tokio::spawn(async move {
             match shared.mms.handle_push(&info).await {
-                Ok(Some(id)) => {
-                    if let Ok(Some(msg)) = shared.db.get_message(id).await {
-                        let body = format_mms_summary(&shared, &msg);
-                        let peer = if msg.peer.is_empty() { peer_fallback } else { msg.peer.clone() };
-                        notify_sip_message(shared.clone(), core, &peer, "text/plain", body).await;
-                    }
-                }
+                // Fetched or not, the SIP side is told about it; the summary
+                // is written from the stored row when it is delivered.
+                Ok(Some(id)) => shared.queue_for_sip(id).await,
                 Ok(None) => {}
                 Err(e) => warn!(error = %format!("{e:#}"), "handling the MMS notification failed"),
             }
@@ -1837,17 +1833,6 @@ impl Gateway {
             }
         });
         Ok(())
-    }
-
-    /// Fire-and-forget: a SIP peer that does not answer must never stall the
-    /// gateway loop (a MESSAGE transaction can take 32 s to time out).
-    fn notify_sip(&self, peer: &str, content_type: &'static str, body: String) {
-        let shared = self.shared.clone();
-        let core = self.core.clone();
-        let peer = peer.to_string();
-        tokio::spawn(async move {
-            notify_sip_message(shared, core, &peer, content_type, body).await;
-        });
     }
 }
 
@@ -1868,26 +1853,42 @@ fn turn_away(modem: Arc<ModemHandle>, path: OwnedObjectPath) {
     });
 }
 
+/// How an attempt to hand a message to the SIP side ended.
+#[derive(Debug)]
+pub enum Delivery {
+    Delivered,
+    /// The peer answered, and the answer was no - to this message, as far
+    /// as anyone can tell, rather than to being asked right now.
+    Refused(u16),
+    /// Nobody to give it to, or nobody answering: worth trying again.
+    Unreachable(String),
+}
+
+/// A final response that says "not now" rather than "not this".
+///
+/// A PBX whose extension is not registered at the moment answers 404 or 480;
+/// one that is restarting answers 5xx.  None of that is about the message.
+fn is_temporary(code: u16) -> bool {
+    matches!(code, 401 | 404 | 407 | 408 | 480 | 486 | 500 | 502 | 503 | 504 | 600)
+}
+
 /// Deliver an incoming message to the SIP side as a MESSAGE request.
-pub async fn notify_sip_message(
-    shared: Arc<Shared>,
-    core: Arc<SipCore>,
+pub async fn send_sip_message(
+    shared: &Arc<Shared>,
+    core: &Arc<SipCore>,
     peer: &str,
     content_type: &str,
     body: String,
-) {
+) -> Delivery {
     let target_cfg = shared
         .cfg
         .sip
         .sms_target
         .clone()
         .or_else(|| shared.cfg.sip.call_target.clone());
-    let (target_uri, addr) = match resolve_target(&core, target_cfg.as_deref()).await {
+    let (target_uri, addr) = match resolve_target(core, target_cfg.as_deref()).await {
         Ok(v) => v,
-        Err(e) => {
-            warn!(error = %format!("{e:#}"), "no SIP destination for the incoming message");
-            return;
-        }
+        Err(e) => return Delivery::Unreachable(format!("{e:#}")),
     };
 
     let domain = core.domain_for(addr);
@@ -1932,9 +1933,15 @@ pub async fn notify_sip_message(
     let creds_ref = creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
 
     match core.transact(req, addr, creds_ref, Duration::from_secs(32)).await {
-        Ok(resp) if resp.is_success() => debug!(code = resp.code, "message delivered over SIP"),
-        Ok(resp) => warn!(code = resp.code, "SIP peer rejected the message"),
-        Err(e) => warn!(error = %format!("{e:#}"), "could not deliver the message over SIP"),
+        Ok(resp) if resp.is_success() => {
+            debug!(code = resp.code, "message delivered over SIP");
+            Delivery::Delivered
+        }
+        Ok(resp) if is_temporary(resp.code) => {
+            Delivery::Unreachable(format!("the SIP peer answered {} {}", resp.code, resp.reason))
+        }
+        Ok(resp) => Delivery::Refused(resp.code),
+        Err(e) => Delivery::Unreachable(format!("{e:#}")),
     }
 }
 

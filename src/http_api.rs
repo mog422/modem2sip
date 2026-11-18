@@ -306,20 +306,7 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                     let msg = shared.db.get_message(id).await.ok().flatten();
                     // The peer was told the body was missing; now that there
                     // is something to pass on, tell it the rest.
-                    if let (Some(core), Some(fetched)) = (shared.sip().await, msg.clone()) {
-                        let shared = shared.clone();
-                        tokio::spawn(async move {
-                            let body = crate::gateway::format_mms_summary(&shared, &fetched);
-                            crate::gateway::notify_sip_message(
-                                shared.clone(),
-                                core,
-                                &fetched.peer,
-                                "text/plain",
-                                body,
-                            )
-                            .await;
-                        });
-                    }
+                    shared.queue_for_sip(id).await;
                     if wants_html(&req) {
                         respond_html(&mut stream, 200, &retrieved_page(&shared, msg.as_ref()))
                             .await

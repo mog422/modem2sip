@@ -365,13 +365,23 @@ pub struct Sms {
     pub delete_from_modem: bool,
     /// Forward received messages to SIP as a MESSAGE request.
     pub notify_sip: bool,
+    /// How long a message nobody on the SIP side could take is kept for
+    /// another try: until a phone registers, or a configured target answers
+    /// again.  After that it stays in the database only.  0 means a single
+    /// attempt at the moment the message arrives.
+    pub notify_retry_hours: u64,
     /// Request a delivery report for outgoing messages.
     pub delivery_report: bool,
 }
 
 impl Default for Sms {
     fn default() -> Self {
-        Self { delete_from_modem: true, notify_sip: true, delivery_report: false }
+        Self {
+            delete_from_modem: true,
+            notify_sip: true,
+            notify_retry_hours: 72,
+            delivery_report: false,
+        }
     }
 }
 

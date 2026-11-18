@@ -22,6 +22,9 @@ pub struct Binding {
 #[derive(Default)]
 pub struct Registrar {
     bindings: Mutex<HashMap<String, Vec<Binding>>>,
+    /// Signalled whenever a contact registers or refreshes: somebody is
+    /// there now, which is the moment to deliver what was held for them.
+    pub changed: tokio::sync::Notify,
 }
 
 impl Registrar {
@@ -45,6 +48,9 @@ impl Registrar {
         }
         if list.is_empty() {
             map.remove(aor);
+        }
+        if expires > 0 {
+            self.changed.notify_one();
         }
     }
 

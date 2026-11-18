@@ -65,6 +65,8 @@ dir = "/srv/modem2sip"
 [sms]
 delete_from_modem = true
 notify_sip        = true
+# Messages nobody could take are held and delivered when a phone registers.
+notify_retry_hours = 72
 
 [mms]
 # MMSC and (on some carriers) proxy are operator specific.  MMS traffic is

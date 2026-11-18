@@ -14,10 +14,9 @@ pub struct Shared {
     pub cfg: Arc<Config>,
     pub db: Db,
     pub mms: Arc<MmsManager>,
-    /// The SIP element, once it exists.  Lets anything holding [`Shared`]
-    /// tell a peer about something - the HTTP API announcing an MMS it has
-    /// just fetched, for instance.
-    sip: RwLock<Option<Arc<crate::sip::SipCore>>>,
+    /// Wakes the task that delivers stored messages to SIP
+    /// ([`crate::outbox`]).
+    pub outbox: tokio::sync::Notify,
     /// `Some` while the configured modem is present and usable.
     modem: RwLock<Option<Arc<ModemHandle>>>,
     /// Cheap, lock-free view of the above for the SIP fast path (503s).
@@ -33,19 +32,24 @@ impl Shared {
             cfg,
             db,
             mms,
-            sip: RwLock::new(None),
+            outbox: tokio::sync::Notify::new(),
             modem: RwLock::new(None),
             modem_ready: Arc::new(AtomicBool::new(false)),
             link_key,
         })
     }
 
-    pub async fn set_sip(&self, core: Arc<crate::sip::SipCore>) {
-        *self.sip.write().await = Some(core);
-    }
-
-    pub async fn sip(&self) -> Option<Arc<crate::sip::SipCore>> {
-        self.sip.read().await.clone()
+    /// Have a stored message announced to the SIP side.
+    ///
+    /// It is marked in the database rather than sent from here, so that it
+    /// still goes out if nobody is there to receive it right now - or if
+    /// the process is restarted before anyone is.
+    pub async fn queue_for_sip(&self, id: i64) {
+        if let Err(e) = self.db.set_sip_pending(id, true).await {
+            tracing::warn!(id, error = %format!("{e:#}"), "cannot queue the message for SIP");
+            return;
+        }
+        self.outbox.notify_one();
     }
 
     pub async fn set_modem(&self, handle: Option<Arc<ModemHandle>>) {

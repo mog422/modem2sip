@@ -135,6 +135,11 @@ db  = "modem2sip.db"                # relative to dir unless absolute
 [sms]
 delete_from_modem = true            # only after the message is safely in SQLite
 notify_sip        = true
+# A message nobody on the SIP side could take - no phone registered, the PBX
+# down - is kept and delivered when someone can: on the next registration,
+# and once a minute for a configured target.  After this many hours it stays
+# in the database only.  0 = a single attempt when the message arrives.
+notify_retry_hours = 72
 delivery_report   = false
 
 # --------------------------------------------------------------------------

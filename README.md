@@ -296,6 +296,14 @@ Incoming messages are stored in SQLite and forwarded as a SIP `MESSAGE`
 (`text/plain`) whose `From` user part is the sender's number. They are deleted
 from the modem/SIM only after the database write succeeds.
 
+A message that cannot be handed over - no phone registered, the PBX not
+answering - is not dropped from the SIP side's point of view: it is kept and
+delivered when somebody can take it, on the next registration or, for a
+configured target, on a once-a-minute retry. Messages go out oldest first.
+`[sms] notify_retry_hours` (default 72) bounds how long that goes on; after
+it the message is in the database and the HTTP API only. The same applies to
+MMS summaries.
+
 Sending: a SIP `MESSAGE` to `sip:<number>@gateway` with a `text/plain` body
 and `To: <sip:<number>@gateway>;messagetype=sms`, or
 `POST /sms {"to": "...", "text": "..."}`. Segmentation and GSM7/UCS2
