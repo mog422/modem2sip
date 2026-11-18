@@ -76,7 +76,6 @@ retry_after_secs = 30
 # allow = ["192.168.1.0/24"]
 # call_target = "sip:2001@192.168.1.10:5060"   # where inbound calls are sent
 # sms_target  = "sip:2001@192.168.1.10:5060"   # defaults to call_target
-# from_user   = "modem1"
 
 # Require inbound requests to authenticate (digest).
 # [sip.auth]

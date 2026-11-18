@@ -196,9 +196,6 @@ pub struct Sip {
     pub early_media: bool,
     /// How long an outbound INVITE may ring before it is abandoned.
     pub ring_timeout_secs: u64,
-    /// User part used in the From header of gateway-originated requests.
-    /// Defaults to the modem's own number.
-    pub from_user: Option<String>,
     /// Reply 503 (instead of 200) to OPTIONS while the modem is unusable.
     /// Handy as a health probe for the upstream proxy.
     pub options_reflect_modem: bool,
@@ -220,7 +217,6 @@ impl Default for Sip {
             register: None,
             early_media: true,
             ring_timeout_secs: 60,
-            from_user: None,
             options_reflect_modem: true,
             retry_after_secs: 30,
         }

@@ -116,6 +116,7 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
             let body = match &modem {
                 Some(m) => json!({
                     "status": "up",
+                    "name": shared.cfg.general.name,
                     "modem": {
                         "path": m.info.path,
                         "manufacturer": m.info.manufacturer,
@@ -135,7 +136,11 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                     })),
                     "mms_enabled": shared.mms.enabled(),
                 }),
-                None => json!({"status": "down", "reason": "no modem"}),
+                None => json!({
+                    "status": "down",
+                    "name": shared.cfg.general.name,
+                    "reason": "no modem",
+                }),
             };
             respond_json(&mut stream, if modem.is_some() { 200 } else { 503 }, &body).await
         }

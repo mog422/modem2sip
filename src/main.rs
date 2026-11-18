@@ -76,6 +76,7 @@ async fn main() -> Result<()> {
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
+        name = %cfg.general.name,
         config = %args.config.display(),
         "starting modem2sip"
     );
