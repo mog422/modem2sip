@@ -32,6 +32,14 @@ pub struct HttpOptions {
     pub dns_servers: Vec<IpAddr>,
 }
 
+impl HttpOptions {
+    /// Is the traffic tied to a particular interface or source address,
+    /// rather than left to the host's own routing?
+    pub fn is_pinned(&self) -> bool {
+        self.interface.is_some() || self.local_ip.is_some()
+    }
+}
+
 #[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,

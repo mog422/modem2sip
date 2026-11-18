@@ -340,6 +340,11 @@ to the data bearer's interface and source address, which it reads from
 ModemManager at request time — no configuration, and it follows the address
 across re-attaches. Pin `mms.interface` / `mms.local_ip` only to override it.
 
+With neither a bearer nor a pinned interface or address, a message is not
+fetched at all: the address to fetch from comes out of the notification,
+which is a binary SMS anybody can send, and without the bearer that request
+would be made from inside the host's own network.
+
 The bearer itself still has to exist and be routable, and that is a host
 networking job: [contrib/mms-bearer](contrib/mms-bearer) connects it and adds
 a default route **in a private routing table** plus rules matching the

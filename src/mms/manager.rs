@@ -96,9 +96,9 @@ impl MmsManager {
                         }
                     }
                     None => warn!(
-                        "no connected data bearer; MMS will use the host's default route \
-                         and resolver.  Connect one (see contrib/mms-bearer) or set \
-                         mms.interface / mms.dns"
+                        "no connected data bearer: submissions go out by the host's default \
+                         route and resolver, and messages cannot be fetched.  Connect one \
+                         (see contrib/mms-bearer) or set mms.interface / mms.local_ip"
                     ),
                 }
             }
@@ -269,6 +269,18 @@ impl MmsManager {
 
         self.run_setup_command().await?;
         let opts = self.http_options().await;
+        // The URL is whatever the notification said, and a notification is a
+        // binary SMS anyone can send to this number.  Through the bearer it
+        // can only reach what the carrier lets a handset reach; left to the
+        // host's own routing it is a request made from inside this network,
+        // to an address an outsider picked.  So without a bearer (or an
+        // explicit mms.interface / mms.local_ip) nothing is fetched.
+        if !opts.is_pinned() {
+            bail!(
+                "no data bearer to fetch the message through (connect one - see \
+                 contrib/mms-bearer - or set mms.interface / mms.local_ip)"
+            );
+        }
         let resp = http::get(&url, &opts).await.context("fetching the MMS body")?;
         if resp.status != 200 {
             bail!("MMSC returned HTTP {}", resp.status);
