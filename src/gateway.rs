@@ -81,6 +81,13 @@ struct ActiveCall {
     remote: NameAddr,
     remote_target: Uri,
     remote_addr: SocketAddr,
+    /// `Route` values for requests inside the dialog (RFC 3261 §12.2.1.1):
+    /// the proxies that asked, with Record-Route, to stay on the path.
+    route_set: Vec<String>,
+    /// The peer was found through its registration, so `remote_addr` is the
+    /// address it registered *from* - the only one known to reach a phone
+    /// behind NAT, whatever its Contact claims.
+    via_registration: bool,
     local_cseq: u32,
     /// The INVITE we received (FromSip) or sent (ToSip).
     invite: Request,
@@ -352,6 +359,8 @@ impl Gateway {
             remote: to,
             remote_target: target_uri,
             remote_addr: target_addr,
+            route_set: Vec::new(),
+            via_registration: self.shared.cfg.sip.call_target.is_none(),
             local_cseq: cseq,
             invite,
             invite_src: None,
@@ -730,6 +739,8 @@ impl Gateway {
             remote: from,
             remote_target,
             remote_addr: src,
+            route_set: crate::sip::core::route_set_from_request(&req),
+            via_registration: false,
             local_cseq: self.core.next_cseq(),
             invite: req,
             invite_src: Some(src),
@@ -1118,7 +1129,7 @@ impl Gateway {
                     return Ok(());
                 }
                 warn!("no answer from the SIP side, cancelling");
-                self.cancel_outgoing_invite().await;
+                self.cancel_outgoing_invite();
                 if let (Some(modem), Some(path)) =
                     (self.modem.clone(), self.call.as_ref().and_then(|c| c.mm_path.clone()))
                 {
@@ -1217,14 +1228,10 @@ impl Gateway {
         if call.role != Role::ToSip {
             return;
         }
-        let mut ack = call.invite.clone();
-        ack.method = Method::Ack;
-        ack.body.clear();
-        ack.headers.remove("content-type");
-        ack.headers.set("cseq", format!("{} ACK", call.local_cseq));
-        if let Some(to) = resp.headers.get("to") {
-            ack.headers.set("to", to.to_string());
-        }
+        let ack = crate::sip::core::ack_for_failure(&call.invite, resp);
+        // This ACK can be lost like any other datagram, and then the peer
+        // sends its rejection again; the SIP element answers those repeats.
+        self.core.invite_abandoned(&call.invite, call.remote_addr);
         let _ = self.core.send_raw(&ack, call.remote_addr).await;
     }
 
@@ -1299,26 +1306,50 @@ impl Gateway {
         if self.call.is_none() {
             return Ok(());
         }
-        // Learn the remote tag and the dialog target from the 2xx.
-        let contact_addr = match resp.headers.contact() {
-            Some(c) => transport::resolve_uri(&c.uri).await.ok().map(|a| (c.uri, a)),
-            None => None,
+        // Learn the remote tag, the dialog target and the route set from
+        // the 2xx.
+        //
+        // The Contact always becomes the Request-URI of what follows.  Where
+        // those requests are *sent* is another matter: a phone behind NAT
+        // puts its private address in the Contact, and the only address that
+        // reaches it is the one it registered from - which is where the
+        // INVITE went.  A proxy that record-routed is likewise the next hop
+        // already.  Only a configured peer with no route set is followed to
+        // its Contact, as RFC 3261 §12.2.1.1 has it.
+        let contact = resp.headers.contact();
+        let route_set = crate::sip::core::route_set_from_response(&resp);
+        let follow_contact = self
+            .call
+            .as_ref()
+            .map(|c| !c.via_registration && route_set.is_empty())
+            .unwrap_or(false);
+        let moved_to = match (&contact, follow_contact) {
+            (Some(c), true) => transport::resolve_uri(&c.uri).await.ok(),
+            _ => None,
         };
         if let Some(call) = self.call.as_mut() {
             if let Some(to) = resp.headers.to() {
                 call.remote = to;
             }
-            if let Some((uri, addr)) = contact_addr {
-                call.remote_target = uri;
+            if let Some(contact) = contact {
+                call.remote_target = contact.uri;
+            }
+            if let Some(addr) = moved_to {
                 call.remote_addr = addr;
             }
+            call.route_set = route_set;
         }
 
         // ACK first: the peer stops retransmitting the 200 as soon as it
         // arrives, which matters more than the media being up.
         let (ack, dest) = {
             let Some(call) = self.call.as_ref() else { return Ok(()) };
-            (build_ack(&self.core, call), call.remote_addr)
+            let ack = build_ack(&self.core, call);
+            // If this ACK is lost the peer repeats its 200, and a 200 nobody
+            // acknowledges ends the call after 32 s.  Leave the ACK with the
+            // SIP element so every repeat is answered with it.
+            self.core.invite_answered(&call.invite, &ack, call.remote_addr);
+            (ack, call.remote_addr)
         };
         self.core.send_raw(&ack, dest).await?;
 
@@ -1579,7 +1610,7 @@ impl Gateway {
                     }
                     let _ = self.core.respond(&snap.invite, snap.invite_dest, resp).await;
                 }
-                Role::ToSip => self.cancel_outgoing_invite().await,
+                Role::ToSip => self.cancel_outgoing_invite(),
             }
         }
 
@@ -1590,18 +1621,16 @@ impl Gateway {
     }
 
     /// CANCEL an INVITE we sent that has not been answered yet.
-    async fn cancel_outgoing_invite(&mut self) {
+    ///
+    /// The SIP element sees the cancellation through: it retransmits the
+    /// CANCEL, acknowledges the 487 that follows, and if the peer answered
+    /// in the same instant it hangs that call up again.
+    fn cancel_outgoing_invite(&mut self) {
         let Some(call) = self.call.as_ref() else { return };
         if call.role != Role::ToSip || call.answered {
             return;
         }
-        let mut cancel = call.invite.clone();
-        cancel.method = Method::Cancel;
-        cancel.body.clear();
-        cancel.headers.set("cseq", format!("{} CANCEL", call.local_cseq));
-        cancel.headers.remove("content-type");
-        let dest = call.remote_addr;
-        let _ = self.core.send_raw(&cancel, dest).await;
+        self.core.cancel_invite(&call.invite, call.remote_addr);
     }
 
     async fn finish_call(&mut self, disposition: &str) {
@@ -2079,7 +2108,7 @@ fn in_dialog_of(call: &ActiveCall, req: &Request) -> bool {
 
 fn build_in_dialog_request(core: &Arc<SipCore>, call: &ActiveCall, method: Method) -> Request {
     let cseq = core.next_cseq();
-    core.build_request(
+    let mut req = core.build_request(
         method,
         call.remote_target.clone(),
         call.local.clone(),
@@ -2088,10 +2117,13 @@ fn build_in_dialog_request(core: &Arc<SipCore>, call: &ActiveCall, method: Metho
         cseq,
         call.remote_addr,
         true,
-    )
+    );
+    add_route_set(&mut req, call);
+    req
 }
 
 fn build_ack(core: &Arc<SipCore>, call: &ActiveCall) -> Request {
+    // The ACK for a 2xx keeps the INVITE's sequence number.
     let mut ack = core.build_request(
         Method::Ack,
         call.remote_target.clone(),
@@ -2102,9 +2134,16 @@ fn build_ack(core: &Arc<SipCore>, call: &ActiveCall) -> Request {
         call.remote_addr,
         true,
     );
-    // The ACK for a 2xx keeps the INVITE's sequence number.
-    ack.headers.set("cseq", format!("{} ACK", call.local_cseq));
+    add_route_set(&mut ack, call);
     ack
+}
+
+/// Proxies that record-routed stay on the path of every request in the
+/// dialog; without their Route headers they have no reason to forward it.
+fn add_route_set(req: &mut Request, call: &ActiveCall) {
+    for route in &call.route_set {
+        req.headers.push("route", route.clone());
+    }
 }
 
 /// Which ALSA devices to use for this call.
@@ -2376,6 +2415,8 @@ mod tests {
             remote: NameAddr::parse("<sip:alice@h>;tag=theirs").unwrap(),
             remote_target: Uri::parse("sip:alice@h").unwrap(),
             remote_addr: "10.0.0.5:5060".parse().unwrap(),
+            route_set: Vec::new(),
+            via_registration: false,
             local_cseq: 1,
             invite: request(Method::Invite, &[("call-id", "call-1"), ("cseq", "1 INVITE")]),
             invite_src: None,

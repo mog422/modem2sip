@@ -28,12 +28,70 @@ pub enum SipEvent {
     Request { req: Request, src: SocketAddr },
 }
 
+/// A client transaction is identified by its branch *and* its method: a
+/// CANCEL reuses the branch of the INVITE it cancels, and the two are
+/// separate transactions that can both be outstanding at once.
+type ClientTxnKey = (String, Method);
+
 struct ClientTxnEntry {
-    /// The method this transaction sent.  A CANCEL reuses the branch of the
-    /// INVITE it cancels, so the branch alone does not identify a response.
-    method: Method,
     tx: mpsc::UnboundedSender<Response>,
     stop_retransmit: Arc<AtomicBool>,
+}
+
+/// What became of an INVITE we sent, once the gateway stopped waiting on it.
+///
+/// The transaction is over as far as the gateway is concerned, but not as far
+/// as the wire is: UDP loses ACKs, and a peer can answer in the same instant
+/// we give up.  Responses that turn up afterwards are dealt with from here.
+enum Settled {
+    /// Answered with a 2xx and acknowledged.  The peer repeats its 2xx until
+    /// the ACK reaches it, so each repeat gets the same ACK again.
+    Answered { ack: Vec<u8> },
+    /// Given up on: rejected, cancelled, or never answered in time.
+    Abandoned { invite: Box<Request> },
+}
+
+struct SettledInvite {
+    state: Settled,
+    dest: SocketAddr,
+    since: Instant,
+}
+
+impl SettledInvite {
+    fn expired(&self, now: Instant) -> bool {
+        let lifetime = match self.state {
+            // A 2xx is retransmitted for 64*T1 at most.
+            Settled::Answered { .. } => Duration::from_secs(64),
+            // An INVITE the peer never heard a CANCEL for can still be
+            // answered for as long as it keeps ringing (RFC 3261 Timer C).
+            Settled::Abandoned { .. } => Duration::from_secs(180),
+        };
+        now.duration_since(self.since) >= lifetime
+    }
+}
+
+/// What a response to a settled INVITE calls for.
+#[derive(Debug, PartialEq, Eq)]
+enum LateReply {
+    Ignore,
+    /// A retransmission of the 2xx we already acknowledged.
+    RepeatAck,
+    /// A final rejection of an INVITE we gave up on: acknowledge it, or the
+    /// peer keeps retransmitting it for 32 s.
+    AckFailure,
+    /// The peer answered an INVITE we had already given up on.  It now
+    /// believes a call is up; acknowledge the answer and end that call.
+    AckAndBye,
+}
+
+fn late_reply(answered: bool, code: u16) -> LateReply {
+    match (answered, code) {
+        (_, 0..=199) => LateReply::Ignore,
+        (true, 200..=299) => LateReply::RepeatAck,
+        (true, _) => LateReply::Ignore,
+        (false, 200..=299) => LateReply::AckAndBye,
+        (false, _) => LateReply::AckFailure,
+    }
 }
 
 /// Server-side transaction state, kept so that a retransmitted request is
@@ -64,7 +122,7 @@ const MAX_REGISTER_EXPIRES: u32 = 3600;
 
 /// Handle for an outstanding client transaction.
 pub struct ClientTxn {
-    pub branch: String,
+    key: ClientTxnKey,
     pub rx: mpsc::UnboundedReceiver<Response>,
     core: Arc<SipCore>,
     stop: Arc<AtomicBool>,
@@ -95,7 +153,7 @@ impl ClientTxn {
 impl Drop for ClientTxn {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.core.client_txns.lock().unwrap().remove(&self.branch);
+        self.core.client_txns.lock().unwrap().remove(&self.key);
     }
 }
 
@@ -104,7 +162,10 @@ pub struct SipCore {
     pub transport: Transport,
     pub registrar: Registrar,
     nonce: NonceFactory,
-    client_txns: Mutex<HashMap<String, ClientTxnEntry>>,
+    client_txns: Mutex<HashMap<ClientTxnKey, ClientTxnEntry>>,
+    /// INVITEs we sent whose transaction the gateway has finished with,
+    /// keyed by branch, for the responses that still arrive afterwards.
+    settled_invites: Mutex<HashMap<String, SettledInvite>>,
     /// Server transactions, keyed by branch+cseq+method.
     server_cache: Mutex<HashMap<String, ServerTxn>>,
     /// Highest nonce-count seen per issued nonce, so a captured Authorization
@@ -142,6 +203,7 @@ impl SipCore {
             registrar: Registrar::new(),
             nonce: NonceFactory::new(),
             client_txns: Mutex::new(HashMap::new()),
+            settled_invites: Mutex::new(HashMap::new()),
             server_cache: Mutex::new(HashMap::new()),
             nonce_seen: Mutex::new(HashMap::new()),
             pending_ack: Arc::new(Mutex::new(HashMap::new())),
@@ -214,9 +276,10 @@ impl SipCore {
         if nonces.len() > 64 {
             nonces.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(600));
         }
+        self.settled_invites.lock().unwrap().retain(|_, s| !s.expired(now));
     }
 
-    fn on_response(&self, resp: Response) {
+    fn on_response(self: &Arc<Self>, resp: Response) {
         let Some(branch) = resp.headers.top_via().and_then(|v| v.branch().map(str::to_string))
         else {
             debug!("response without Via branch, dropped");
@@ -226,18 +289,13 @@ impl SipCore {
             debug!(%branch, "response without a usable CSeq, dropped");
             return;
         };
-        let map = self.client_txns.lock().unwrap();
-        match map.get(&branch) {
-            // A CANCEL carries the branch of the INVITE it cancels, so its
-            // 200 OK would otherwise be delivered as if the INVITE had been
-            // answered.
-            Some(entry) if entry.method != method => debug!(
-                %branch,
-                code = resp.code,
-                %method,
-                "response method does not match the transaction, dropped"
-            ),
-            Some(entry) => {
+        // Looked up by branch and method together: a CANCEL carries the
+        // branch of the INVITE it cancels, and its 200 OK must not be
+        // delivered as if the INVITE had been answered.
+        let key = (branch, method);
+        {
+            let map = self.client_txns.lock().unwrap();
+            if let Some(entry) = map.get(&key) {
                 // RFC 3261 §17.1.2.2: a non-INVITE transaction keeps
                 // retransmitting after a provisional, because the server side
                 // only re-sends its final answer when it sees the request
@@ -245,13 +303,163 @@ impl SipCore {
                 // final response was never recovered - the SMS or the
                 // registration simply timed out.  For an INVITE the
                 // provisional is the signal to stop.
-                if resp.code >= 200 || entry.method == Method::Invite {
+                if resp.code >= 200 || method == Method::Invite {
                     entry.stop_retransmit.store(true, Ordering::Relaxed);
                 }
                 let _ = entry.tx.send(resp);
+                return;
             }
-            None => debug!(%branch, code = resp.code, "response for unknown transaction"),
         }
+        let (branch, _) = key;
+        if method == Method::Invite {
+            self.on_late_invite_response(&branch, resp);
+        } else {
+            debug!(%branch, code = resp.code, %method, "response for unknown transaction");
+        }
+    }
+
+    /// A response to an INVITE nobody is waiting on any more.
+    fn on_late_invite_response(self: &Arc<Self>, branch: &str, resp: Response) {
+        let mut map = self.settled_invites.lock().unwrap();
+        let Some(entry) = map.get_mut(branch) else {
+            debug!(%branch, code = resp.code, "response for unknown transaction");
+            return;
+        };
+        let dest = entry.dest;
+        let answered = matches!(entry.state, Settled::Answered { .. });
+        match (late_reply(answered, resp.code), &entry.state) {
+            (LateReply::RepeatAck, Settled::Answered { ack }) => {
+                debug!(%branch, "the 2xx was retransmitted; repeating the ACK");
+                self.send_detached(ack.clone(), dest);
+            }
+            (LateReply::AckFailure, Settled::Abandoned { invite }) => {
+                debug!(%branch, code = resp.code, "acknowledging the end of an INVITE we gave up on");
+                self.send_detached(ack_for_failure(invite, &resp).encode(), dest);
+            }
+            (LateReply::AckAndBye, Settled::Abandoned { invite }) => {
+                let Some((ack, bye)) = self.ack_and_bye(invite, &resp, dest) else {
+                    warn!(%branch, "a 2xx for an abandoned INVITE cannot be answered; ignoring it");
+                    return;
+                };
+                warn!(
+                    %branch,
+                    "the SIP side answered a call we had already given up on; hanging it up"
+                );
+                let ack = ack.encode();
+                // From here on this is an answered INVITE: repeats of the 2xx
+                // get the ACK again, and the BYE goes out only once.
+                entry.state = Settled::Answered { ack: ack.clone() };
+                entry.since = Instant::now();
+                drop(map);
+                let core = self.clone();
+                tokio::spawn(async move {
+                    let _ = core.transport.send(&ack, dest).await;
+                    if let Ok(mut txn) = core.send_request(bye, dest).await {
+                        let _ = txn.final_response(Duration::from_secs(32)).await;
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// The ACK and the BYE that end a dialog a late 2xx has just created.
+    fn ack_and_bye(
+        &self,
+        invite: &Request,
+        resp: &Response,
+        dest: SocketAddr,
+    ) -> Option<(Request, Request)> {
+        let from = invite.headers.from()?;
+        let to = resp.headers.to()?;
+        let call_id = invite.headers.call_id()?;
+        let (cseq, _) = invite.headers.cseq()?;
+        let target = resp.headers.contact().map(|c| c.uri).unwrap_or_else(|| invite.uri.clone());
+        let mut ack = self.build_request(
+            Method::Ack,
+            target.clone(),
+            from.clone(),
+            to.clone(),
+            call_id,
+            cseq,
+            dest,
+            false,
+        );
+        let mut bye =
+            self.build_request(Method::Bye, target, from, to, call_id, self.next_cseq(), dest, false);
+        for route in route_set_from_response(resp) {
+            ack.headers.push("route", route.clone());
+            bye.headers.push("route", route);
+        }
+        Some((ack, bye))
+    }
+
+    fn send_detached(self: &Arc<Self>, bytes: Vec<u8>, dest: SocketAddr) {
+        let core = self.clone();
+        tokio::spawn(async move {
+            let _ = core.transport.send(&bytes, dest).await;
+        });
+    }
+
+    /// The INVITE we sent was answered with a 2xx and `ack` has gone out (or
+    /// is about to).
+    ///
+    /// The peer cannot tell a lost ACK from a caller that has gone away: it
+    /// repeats its 2xx, and if nothing ever acknowledges it, ends the call
+    /// after 32 s.  So the ACK is kept and sent again for every repeat.
+    pub fn invite_answered(&self, invite: &Request, ack: &Request, dest: SocketAddr) {
+        self.settle_invite(invite, Settled::Answered { ack: ack.encode() }, dest);
+    }
+
+    /// The gateway is done with an INVITE it sent that was not answered:
+    /// it was rejected, or it is being given up on.
+    ///
+    /// Whatever final response still arrives is acknowledged - a rejection
+    /// that is not ACKed is retransmitted for 32 s - and a 2xx, from a peer
+    /// that picked up in the same moment, is acknowledged and then ended with
+    /// a BYE rather than left as a call only one side knows about.
+    pub fn invite_abandoned(&self, invite: &Request, dest: SocketAddr) {
+        if let Some(branch) = self.settle_invite(
+            invite,
+            Settled::Abandoned { invite: Box::new(invite.clone()) },
+            dest,
+        ) {
+            // Nobody is listening on the transaction any more; responses go
+            // to the record just made instead.
+            if let Some(entry) =
+                self.client_txns.lock().unwrap().remove(&(branch, Method::Invite))
+            {
+                entry.stop_retransmit.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn settle_invite(&self, invite: &Request, state: Settled, dest: SocketAddr) -> Option<String> {
+        let branch = invite.headers.top_via().and_then(|v| v.branch().map(str::to_string))?;
+        self.settled_invites
+            .lock()
+            .unwrap()
+            .insert(branch.clone(), SettledInvite { state, dest, since: Instant::now() });
+        Some(branch)
+    }
+
+    /// Give up on an INVITE we sent that is still ringing.
+    ///
+    /// The CANCEL is a transaction of its own and is retransmitted like any
+    /// other request - sent once, a single lost datagram left the SIP phone
+    /// ringing for a call that no longer existed.
+    pub fn cancel_invite(self: &Arc<Self>, invite: &Request, dest: SocketAddr) {
+        self.invite_abandoned(invite, dest);
+        let cancel = cancel_for(invite);
+        let core = self.clone();
+        tokio::spawn(async move {
+            match core.send_request(cancel, dest).await {
+                Ok(mut txn) => {
+                    let _ = txn.final_response(Duration::from_secs(32)).await;
+                }
+                Err(e) => debug!(error = %format!("{e:#}"), "could not send the CANCEL"),
+            }
+        });
     }
 
     async fn on_request(self: &Arc<Self>, req: Request, src: SocketAddr) -> Result<()> {
@@ -643,10 +851,11 @@ impl SipCore {
 
         let (tx, rx) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
-        self.client_txns.lock().unwrap().insert(
-            branch.clone(),
-            ClientTxnEntry { method: req.method, tx, stop_retransmit: stop.clone() },
-        );
+        let key: ClientTxnKey = (branch, req.method);
+        self.client_txns
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ClientTxnEntry { tx, stop_retransmit: stop.clone() });
 
         self.transport.send(&bytes, dest).await?;
 
@@ -669,7 +878,7 @@ impl SipCore {
             }
         });
 
-        Ok(ClientTxn { branch, rx, core: self.clone(), stop })
+        Ok(ClientTxn { key, rx, core: self.clone(), stop })
     }
 
     /// Fire-and-forget (ACK, and requests we do not track).
@@ -790,6 +999,57 @@ pub fn refresh_via_branch(headers: &mut Headers) {
             headers.set("via", via.to_string());
         }
     }
+}
+
+/// RFC 3261 §17.1.1.3: the ACK for a non-2xx final response to an INVITE.
+///
+/// It belongs to the INVITE's own transaction, so it reuses the INVITE's
+/// branch and sequence number, and takes the To header - with the peer's tag
+/// - from the response it acknowledges.
+pub fn ack_for_failure(invite: &Request, resp: &Response) -> Request {
+    let mut ack = invite.clone();
+    ack.method = Method::Ack;
+    ack.body.clear();
+    ack.headers.remove("content-type");
+    if let Some((cseq, _)) = invite.headers.cseq() {
+        ack.headers.set("cseq", format!("{cseq} ACK"));
+    }
+    if let Some(to) = resp.headers.get("to") {
+        ack.headers.set("to", to.to_string());
+    }
+    ack
+}
+
+/// RFC 3261 §9.1: the CANCEL for an INVITE we sent.  Same branch, same
+/// sequence number, no body.
+fn cancel_for(invite: &Request) -> Request {
+    let mut cancel = invite.clone();
+    cancel.method = Method::Cancel;
+    cancel.body.clear();
+    cancel.headers.remove("content-type");
+    if let Some((cseq, _)) = invite.headers.cseq() {
+        cancel.headers.set("cseq", format!("{cseq} CANCEL"));
+    }
+    cancel
+}
+
+/// The route set a dialog we started has to use (RFC 3261 §12.1.2): the
+/// Record-Route entries of the 2xx, in reverse order.
+///
+/// A proxy that record-routes expects every later request of the dialog to
+/// come back through it; a BYE sent straight to the peer's Contact instead
+/// is dropped by the proxy's NAT or rejected by the peer.
+pub fn route_set_from_response(resp: &Response) -> Vec<String> {
+    let mut routes: Vec<String> =
+        resp.headers.get_all("record-route").into_iter().flat_map(split_contacts).collect();
+    routes.reverse();
+    routes
+}
+
+/// The route set of a dialog the peer started (RFC 3261 §12.1.1): the
+/// Record-Route entries of its INVITE, in the order they appear.
+pub fn route_set_from_request(req: &Request) -> Vec<String> {
+    req.headers.get_all("record-route").into_iter().flat_map(split_contacts).collect()
 }
 
 /// What to do with a request whose transaction may already be known.
@@ -989,6 +1249,80 @@ mod tests {
         assert_eq!(txn_key(&raw("INVITE")), txn_key(&raw("INVITE")));
     }
 
+    /// Responses keep arriving after the gateway has finished with an INVITE
+    /// it sent, and each kind needs its own answer.  Dropping them all, as
+    /// used to happen, cost a connected call for one lost ACK.
+    #[test]
+    fn late_responses_to_an_invite_we_sent_are_still_answered() {
+        // Answered and ACKed: the 2xx coming again means the ACK was lost.
+        assert_eq!(late_reply(true, 200), LateReply::RepeatAck);
+        assert_eq!(late_reply(true, 180), LateReply::Ignore);
+        assert_eq!(late_reply(true, 487), LateReply::Ignore);
+
+        // Given up on: the 487 that follows our CANCEL (or any other
+        // rejection) has to be acknowledged...
+        assert_eq!(late_reply(false, 487), LateReply::AckFailure);
+        assert_eq!(late_reply(false, 603), LateReply::AckFailure);
+        // ...and a peer that picked up at the same moment must not be left
+        // holding a call nobody else knows about.
+        assert_eq!(late_reply(false, 200), LateReply::AckAndBye);
+        assert_eq!(late_reply(false, 183), LateReply::Ignore);
+    }
+
+    /// The ACK for a rejection and the CANCEL both belong to the INVITE's
+    /// transaction: same branch, same sequence number, no body.
+    #[test]
+    fn the_ack_and_the_cancel_stay_inside_the_invite_transaction() {
+        let parse = |text: &str| Message::parse(text.as_bytes()).unwrap();
+        let Message::Request(invite) = parse(
+            "INVITE sip:phone1@10.0.0.5 SIP/2.0\r\nVia: SIP/2.0/UDP gw;branch=z9hG4bKabc\r\n\
+             From: <sip:010@gw>;tag=ours\r\nTo: <sip:phone1@10.0.0.5>\r\nCall-ID: c1\r\n\
+             CSeq: 7 INVITE\r\nContent-Type: application/sdp\r\nContent-Length: 3\r\n\r\nv=0",
+        ) else {
+            panic!("expected a request")
+        };
+        let Message::Response(busy) = parse(
+            "SIP/2.0 486 Busy Here\r\nVia: SIP/2.0/UDP gw;branch=z9hG4bKabc\r\n\
+             From: <sip:010@gw>;tag=ours\r\nTo: <sip:phone1@10.0.0.5>;tag=theirs\r\n\
+             Call-ID: c1\r\nCSeq: 7 INVITE\r\n\r\n",
+        ) else {
+            panic!("expected a response")
+        };
+
+        let ack = ack_for_failure(&invite, &busy);
+        assert_eq!(ack.method, Method::Ack);
+        assert_eq!(ack.headers.top_via().unwrap().branch(), Some("z9hG4bKabc"));
+        assert_eq!(ack.headers.cseq(), Some((7, Method::Ack)));
+        assert_eq!(ack.headers.to().unwrap().tag(), Some("theirs"));
+        assert!(ack.body.is_empty() && ack.headers.content_type().is_none());
+
+        let cancel = cancel_for(&invite);
+        assert_eq!(cancel.method, Method::Cancel);
+        assert_eq!(cancel.headers.top_via().unwrap().branch(), Some("z9hG4bKabc"));
+        assert_eq!(cancel.headers.cseq(), Some((7, Method::Cancel)));
+        assert!(cancel.headers.to().unwrap().tag().is_none());
+        assert!(cancel.body.is_empty());
+    }
+
+    /// The caller's route set is the Record-Route of the 2xx read backwards,
+    /// whether the proxies wrote one header each or folded them into one.
+    #[test]
+    fn the_route_set_is_the_record_route_reversed() {
+        let Message::Response(ok) = Message::parse(
+            b"SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP gw;branch=z9hG4bK1\r\n\
+              Record-Route: <sip:p2.example;lr>, <sip:p1.example;lr>\r\n\
+              Record-Route: <sip:p0.example;lr>\r\n\
+              From: <sip:a@gw>;tag=1\r\nTo: <sip:b@h>;tag=2\r\nCall-ID: c\r\nCSeq: 1 INVITE\r\n\r\n",
+        )
+        .unwrap() else {
+            panic!("expected a response")
+        };
+        assert_eq!(
+            route_set_from_response(&ok),
+            vec!["<sip:p0.example;lr>", "<sip:p1.example;lr>", "<sip:p2.example;lr>"]
+        );
+    }
+
     /// A retransmitted request has to be recognised while it is still being
     /// handled, not only once it has been answered - a MESSAGE that takes a
     /// few seconds at the modem used to send the SMS once per retransmission.
@@ -1030,5 +1364,195 @@ mod tests {
         assert_eq!(claim_txn(&mut cache, key, t0 + TXN_LIFETIME * 2), Claim::Fresh);
         // A different transaction is never confused with this one.
         assert_eq!(claim_txn(&mut cache, "z9hG4bK1|8|MESSAGE", t0), Claim::Fresh);
+    }
+
+    // ---- the client side of an INVITE, over a real socket ----------------
+
+    use tokio::net::UdpSocket;
+
+    /// A SIP element on loopback and a bare socket standing in for its peer.
+    async fn element_and_peer() -> (Arc<SipCore>, UdpSocket, SocketAddr) {
+        let mut cfg = Config::default();
+        cfg.sip.bind = "127.0.0.1:0".into();
+        let (events, _unused) = mpsc::channel(8);
+        let core = SipCore::new(Arc::new(cfg), events, Arc::new(AtomicBool::new(true)))
+            .await
+            .unwrap();
+        tokio::spawn(core.clone().run());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        (core, peer, peer_addr)
+    }
+
+    fn invite_to(core: &Arc<SipCore>, peer: SocketAddr) -> Request {
+        let mut invite = core.build_request(
+            Method::Invite,
+            Uri::parse(&format!("sip:phone1@{peer}")).unwrap(),
+            NameAddr::parse("<sip:01012345678@gw>;tag=ours").unwrap(),
+            NameAddr::parse(&format!("<sip:phone1@{peer}>")).unwrap(),
+            "call-under-test",
+            core.next_cseq(),
+            peer,
+            true,
+        );
+        invite.headers.set("content-type", "application/sdp");
+        invite.body = b"v=0\r\n".to_vec();
+        invite
+    }
+
+    /// Everything the element sends the peer within `window`.
+    async fn requests_within(peer: &UdpSocket, window: Duration) -> Vec<Request> {
+        let deadline = tokio::time::Instant::now() + window;
+        let mut buf = vec![0u8; 4096];
+        let mut seen = Vec::new();
+        while let Ok(Ok((len, _))) =
+            tokio::time::timeout_at(deadline, peer.recv_from(&mut buf)).await
+        {
+            if let Some(Message::Request(req)) = Message::parse(&buf[..len]) {
+                seen.push(req);
+            }
+        }
+        seen
+    }
+
+    async fn next_request(peer: &UdpSocket) -> Request {
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(3), peer.recv_from(&mut buf))
+            .await
+            .expect("the element sent nothing")
+            .unwrap();
+        match Message::parse(&buf[..len]) {
+            Some(Message::Request(req)) => req,
+            other => panic!("expected a request, got {other:?}"),
+        }
+    }
+
+    /// The peer's answer to `req`, with its own tag on the To header.
+    async fn answer(peer: &UdpSocket, core: &Arc<SipCore>, req: &Request, code: u16) {
+        let mut resp = req.reply(code, reason_phrase(code));
+        if let Some(to) = resp.headers.to() {
+            resp.headers.set("to", to.with_tag("theirs").to_string());
+        }
+        resp.headers.set("contact", format!("<sip:phone1@{}>", peer.local_addr().unwrap()));
+        peer.send_to(&resp.encode(), core.transport.bound()).await.unwrap();
+    }
+
+    fn branch_of(req: &Request) -> String {
+        req.headers.top_via().unwrap().branch().unwrap().to_string()
+    }
+
+    /// One lost ACK used to cost the call: the peer repeats its 200, nobody
+    /// answers the repeat, and after 32 s it hangs up.
+    #[tokio::test]
+    async fn a_retransmitted_200_is_acknowledged_again() {
+        let (core, peer, peer_addr) = element_and_peer().await;
+        let invite = invite_to(&core, peer_addr);
+        let mut txn = core.send_request(invite.clone(), peer_addr).await.unwrap();
+
+        let seen = next_request(&peer).await;
+        assert_eq!(seen.method, Method::Invite);
+        answer(&peer, &core, &seen, 200).await;
+        let ok = txn.next_response(Duration::from_secs(3)).await.expect("no 200 delivered");
+        assert_eq!(ok.code, 200);
+
+        // What the gateway does on an answer: ACK, and let go of the INVITE.
+        let ack = core.build_request(
+            Method::Ack,
+            invite.uri.clone(),
+            invite.headers.from().unwrap(),
+            ok.headers.to().unwrap(),
+            "call-under-test",
+            invite.headers.cseq().unwrap().0,
+            peer_addr,
+            false,
+        );
+        core.invite_answered(&invite, &ack, peer_addr);
+        core.send_raw(&ack, peer_addr).await.unwrap();
+        drop(txn);
+        assert_eq!(next_request(&peer).await.method, Method::Ack);
+
+        // The ACK "was lost": the peer says 200 again, twice.
+        for _ in 0..2 {
+            answer(&peer, &core, &seen, 200).await;
+            let again = next_request(&peer).await;
+            assert_eq!(again.method, Method::Ack);
+            assert_eq!(again.headers.cseq(), Some((invite.headers.cseq().unwrap().0, Method::Ack)));
+            assert_eq!(again.headers.to().unwrap().tag(), Some("theirs"));
+        }
+        // And nothing but ACKs: this call is up, it must not be hung up.
+        let extra = requests_within(&peer, Duration::from_millis(300)).await;
+        assert!(extra.iter().all(|r| r.method != Method::Bye), "a live call was sent a BYE");
+    }
+
+    /// Giving up on a ringing INVITE: the CANCEL is repeated until it is
+    /// answered, and the 487 that follows is acknowledged inside the
+    /// INVITE's own transaction.
+    #[tokio::test]
+    async fn a_cancel_is_retransmitted_and_its_487_acknowledged() {
+        let (core, peer, peer_addr) = element_and_peer().await;
+        let invite = invite_to(&core, peer_addr);
+        let txn = core.send_request(invite.clone(), peer_addr).await.unwrap();
+        let seen = next_request(&peer).await;
+        answer(&peer, &core, &seen, 180).await;
+
+        core.cancel_invite(&invite, peer_addr);
+        drop(txn);
+
+        // Unanswered, the CANCEL comes again.
+        let first = next_request(&peer).await;
+        assert_eq!(first.method, Method::Cancel);
+        assert_eq!(branch_of(&first), branch_of(&invite), "a CANCEL shares the INVITE's branch");
+        let second = next_request(&peer).await;
+        assert_eq!(second.method, Method::Cancel, "the CANCEL was sent only once");
+
+        answer(&peer, &core, &second, 200).await;
+        answer(&peer, &core, &seen, 487).await;
+        let acks: Vec<Request> = requests_within(&peer, Duration::from_millis(600))
+            .await
+            .into_iter()
+            .filter(|r| r.method == Method::Ack)
+            .collect();
+        assert_eq!(acks.len(), 1, "the 487 was not acknowledged exactly once");
+        assert_eq!(branch_of(&acks[0]), branch_of(&invite));
+        assert_eq!(acks[0].headers.to().unwrap().tag(), Some("theirs"));
+    }
+
+    /// The peer picks up in the same instant we give up.  It now believes a
+    /// call is up, and used to be left believing it: no ACK, no BYE.
+    #[tokio::test]
+    async fn an_answer_that_crosses_the_cancel_is_acknowledged_and_hung_up() {
+        let (core, peer, peer_addr) = element_and_peer().await;
+        let invite = invite_to(&core, peer_addr);
+        let txn = core.send_request(invite.clone(), peer_addr).await.unwrap();
+        let seen = next_request(&peer).await;
+        answer(&peer, &core, &seen, 180).await;
+
+        core.cancel_invite(&invite, peer_addr);
+        drop(txn);
+        let cancel = next_request(&peer).await;
+        assert_eq!(cancel.method, Method::Cancel);
+        answer(&peer, &core, &cancel, 200).await;
+
+        // ...but the phone had already been answered.
+        answer(&peer, &core, &seen, 200).await;
+        let sent = requests_within(&peer, Duration::from_millis(400)).await;
+        let ack = sent.iter().find(|r| r.method == Method::Ack).expect("the 200 was not ACKed");
+        let bye = sent.iter().find(|r| r.method == Method::Bye).expect("the call was not ended");
+        assert_ne!(branch_of(ack), branch_of(&invite), "the ACK for a 2xx is its own transaction");
+        for req in [ack, bye] {
+            assert_eq!(req.headers.call_id(), Some("call-under-test"));
+            assert_eq!(req.headers.from().unwrap().tag(), Some("ours"));
+            assert_eq!(req.headers.to().unwrap().tag(), Some("theirs"));
+        }
+        let invite_cseq = invite.headers.cseq().unwrap().0;
+        assert_eq!(ack.headers.cseq(), Some((invite_cseq, Method::Ack)));
+        assert!(bye.headers.cseq().unwrap().0 > invite_cseq, "the BYE must be numbered after the INVITE");
+        answer(&peer, &core, bye, 200).await;
+
+        // A repeat of that 200 gets its ACK again, but one BYE is enough.
+        answer(&peer, &core, &seen, 200).await;
+        let sent = requests_within(&peer, Duration::from_millis(400)).await;
+        assert!(sent.iter().any(|r| r.method == Method::Ack), "the repeated 200 was ignored");
+        assert!(sent.iter().all(|r| r.method != Method::Bye), "the call was hung up twice");
     }
 }
