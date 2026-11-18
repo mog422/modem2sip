@@ -518,6 +518,14 @@ fn load_attachments(conn: &Connection, message_id: i64) -> Result<Vec<Attachment
     Ok(rows)
 }
 
+/// Longest attachment file name stored, in bytes, before the index prefix.
+///
+/// File systems cap a name at 255 bytes, and the name comes straight from
+/// the sender of the MMS.  One that did not fit made the write fail, the
+/// whole message with it, and - since a message that is never stored is
+/// never acknowledged - every retry the carrier offered afterwards.
+const MAX_NAME_BYTES: usize = 120;
+
 fn sanitize_name(name: Option<&str>, index: i64, content_type: &str) -> String {
     let base = name
         .map(|n| {
@@ -526,8 +534,29 @@ fn sanitize_name(name: Option<&str>, index: i64, content_type: &str) -> String {
                 .collect::<String>()
         })
         .filter(|n| !n.is_empty() && n != "." && n != "..")
+        .map(|n| shorten(&n, MAX_NAME_BYTES))
         .unwrap_or_else(|| format!("part{index}{}", ext_for(content_type)));
     format!("{index}_{base}")
+}
+
+/// Cut a file name down to `max` bytes, keeping its extension.
+///
+/// Counted in bytes because that is what the file system counts, and cut on
+/// a character boundary: a Korean name is three bytes a letter.
+fn shorten(name: &str, max: usize) -> String {
+    if name.len() <= max {
+        return name.to_string();
+    }
+    // An extension is worth keeping only if it looks like one.
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 && name.len() - dot <= 16 => name.split_at(dot),
+        _ => (name, ""),
+    };
+    let mut cut = max.saturating_sub(ext.len()).min(stem.len());
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{ext}", &stem[..cut])
 }
 
 fn ext_for(content_type: &str) -> &'static str {
@@ -609,6 +638,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(db.list_messages(10, None).await.unwrap().len(), 3);
+    }
+
+    /// The name of a part is whatever the sender called it.  One too long for
+    /// the file system used to fail the write, and with it the whole message.
+    #[test]
+    fn an_overlong_attachment_name_is_shortened_not_refused() {
+        let long = format!("{}.jpg", "가".repeat(200)); // 600 bytes of stem
+        let stored = sanitize_name(Some(&long), 3, "image/jpeg");
+        assert!(stored.len() <= 255, "{} bytes", stored.len());
+        assert!(stored.starts_with("3_가"));
+        assert!(stored.ends_with(".jpg"), "the extension went missing: {stored}");
+        // Cut between characters, never through one.
+        assert!(stored.chars().all(|c| c == '가' || c.is_ascii()));
+
+        // No extension to keep, and a "dot" that is not one.
+        assert!(sanitize_name(Some(&"x".repeat(900)), 1, "image/png").len() <= 255);
+        assert!(sanitize_name(Some(&format!("a.{}", "b".repeat(900))), 1, "image/png").len() <= 255);
+        // Ordinary names are left exactly as they were.
+        assert_eq!(sanitize_name(Some("IMG_0001.jpg"), 2, "image/jpeg"), "2_IMG_0001.jpg");
+        assert_eq!(sanitize_name(Some("../../etc/passwd"), 1, "text/plain"), "1_.._.._etc_passwd");
+        assert_eq!(sanitize_name(None, 4, "image/png"), "4_part4.png");
+    }
+
+    /// A part with such a name has to end up on disk.
+    #[tokio::test]
+    async fn an_attachment_with_an_overlong_name_is_stored() {
+        let db = temp_db("longname").await;
+        let id = db
+            .insert_message(received("01012345678", "", "2026-07-31T15:24:46+09", "mms-long"))
+            .await
+            .unwrap()
+            .unwrap();
+        let name = format!("{}.jpg", "사진".repeat(150));
+        let att = db.add_attachment(id, 1, "image/jpeg", Some(&name), None, b"jpeg").await.unwrap();
+        assert_eq!(std::fs::read(&att.path).unwrap(), b"jpeg");
+        // The name the sender gave is still what the record says.
+        assert_eq!(att.name.as_deref(), Some(name.as_str()));
     }
 
     /// Sending the same text twice is a normal thing to do, and those rows
