@@ -499,6 +499,12 @@ impl Gateway {
 
         if let Some(c) = self.call.as_mut() {
             c.answered = true;
+            // The inactivity watchdog starts counting here.  The session may
+            // have been open for the whole time the call was ringing, and
+            // none of that silence says anything about the peer.
+            if let Some(media) = c.media.as_ref() {
+                media.reset_silence();
+            }
         }
         if let Some(id) = cdr_id {
             let _ = self.shared.db.call_answered(id).await;
@@ -1428,6 +1434,13 @@ impl Gateway {
             self.teardown_call("the modem audio stream died", 200).await;
             return;
         }
+        // Until the call is answered there is nothing to conclude from the
+        // peer's silence.  The audio path is opened as soon as the far end
+        // starts ringing, so the caller can hear the network, but a caller
+        // has no reason to send anything before the 200 OK and most do not.
+        // Counting that as a dead peer ended every call that rang for longer
+        // than the timeout, just as it might have been picked up.
+        let answered = self.call.as_ref().map(|c| c.answered).unwrap_or(false);
         // A peer that offered a=recvonly or a=inactive has told us it will
         // send nothing, so its silence is not evidence that it has gone away.
         // Reading it that way would hang up a perfectly good call whenever a
@@ -1439,7 +1452,7 @@ impl Gateway {
             .map(|s| s.sendrecv.peer_sends())
             .unwrap_or(true);
         let timeout = Duration::from_secs(self.shared.cfg.rtp.timeout_secs);
-        if peer_sends && !timeout.is_zero() && media.silence() > timeout {
+        if answered && peer_sends && !timeout.is_zero() && media.silence() > timeout {
             // Nothing else would ever end this call: a peer that vanished
             // without a BYE cannot be asked, and the mobile leg stays up -
             // and billed - until the process is restarted.
