@@ -421,7 +421,11 @@ Tested against KT (`http://mmsc.ktfwing.com:9082`):
 
 Set `http.token` to require `Authorization: Bearer <token>`. The API binds to
 localhost by default; it has no TLS, so put it behind a proxy if you expose
-it. Attachments are served with `nosniff` and `Content-Disposition:
+it. The links the gateway sends to SIP peers - attachments, and "fetch it" -
+are opened by tapping them, where no such header can be sent, so with a
+token set each of them carries a signature (`?sig=...`) that opens that one
+item with `GET` and nothing else. The key behind it is `link.key` in
+`storage.dir`. Attachments are served with `nosniff` and `Content-Disposition:
 attachment`, because both the bytes and the declared media type come from
 whoever sent the MMS.
 

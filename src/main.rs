@@ -89,7 +89,8 @@ async fn main() -> Result<()> {
     info!(path = %cfg.storage.db_path().display(), "database ready");
 
     let mms = Arc::new(mms::MmsManager::new(cfg.clone(), db.clone()));
-    let shared = state::Shared::new(cfg.clone(), db, mms);
+    let link_key = state::load_link_key(&cfg.storage.dir).await;
+    let shared = state::Shared::new(cfg.clone(), db, mms, link_key);
 
     // --- wiring ------------------------------------------------------------
     let (sip_tx, sip_rx) = mpsc::channel(64);

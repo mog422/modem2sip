@@ -98,18 +98,25 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
         None => return Ok(()),
     };
 
+    let segments: Vec<&str> = req.path.trim_matches('/').split('/').collect();
+
     if let Some(token) = &shared.cfg.http.token {
         let presented = req
             .header("authorization")
             .and_then(|v| v.trim().strip_prefix("Bearer "))
             .map(str::trim)
             .unwrap_or("");
-        if !constant_time_eq(presented, token) {
+        // A link sent to a SIP peer carries its own, narrower credential: a
+        // signature that opens that one message or attachment.
+        let signed = is_linkable(&req.method, &segments)
+            && req
+                .query_param("sig")
+                .is_some_and(|sig| shared.link_signature_ok(&format!("/{}", segments.join("/")), &sig));
+        if !constant_time_eq(presented, token) && !signed {
             return respond_json(&mut stream, 401, &json!({"error": "unauthorized"})).await;
         }
     }
 
-    let segments: Vec<&str> = req.path.trim_matches('/').split('/').collect();
     match (req.method.as_str(), segments.as_slice()) {
         ("GET", [""]) | ("GET", ["health"]) => {
             let modem = shared.modem().await;
@@ -418,6 +425,18 @@ async fn read_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>> {
     Ok(Some(HttpRequest { method, path, query, headers, body }))
 }
 
+/// The requests a signed link may stand in for: exactly the ones the gateway
+/// hands out links to, and only as a `GET`.
+fn is_linkable(method: &str, segments: &[&str]) -> bool {
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    method == "GET"
+        && match segments {
+            ["messages", id, "retrieve"] => numeric(id),
+            ["messages", id, "attachments", index] => numeric(id) && numeric(index),
+            _ => false,
+        }
+}
+
 /// A browser asked, rather than a script.
 fn wants_html(req: &HttpRequest) -> bool {
     req.header("accept").map(|a| a.contains("text/html")).unwrap_or(false)
@@ -432,7 +451,6 @@ fn retrieved_page(shared: &Arc<Shared>, msg: Option<&crate::db::StoredMessage>) 
     let Some(msg) = msg else {
         return "<h2>Fetched</h2>".to_string();
     };
-    let base = shared.http_base_url();
     let mut out = String::from("<h2>Fetched</h2>");
     out.push_str(&format!("<p>From {}", escape_html(&msg.peer)));
     if let Some(subject) = msg.subject.as_deref().filter(|s| !s.is_empty()) {
@@ -446,10 +464,10 @@ fn retrieved_page(shared: &Arc<Shared>, msg: Option<&crate::db::StoredMessage>) 
         out.push_str("<ul>");
         for att in &msg.attachments {
             out.push_str(&format!(
-                "<li><a href=\"{}/messages/{}/attachments/{}\">{}</a> ({})</li>",
-                base,
-                msg.id,
-                att.index,
+                "<li><a href=\"{}\">{}</a> ({})</li>",
+                escape_html(
+                    &shared.http_link(&format!("/messages/{}/attachments/{}", msg.id, att.index))
+                ),
                 escape_html(att.name.as_deref().unwrap_or("part")),
                 escape_html(&att.content_type)
             ));
@@ -573,6 +591,23 @@ mod tests {
         }
         // Absurdly long values are cut rather than echoed in full.
         assert!(sanitize_media_type(&format!("image/{}", "a".repeat(500))).len() <= 128);
+    }
+
+    /// A signed link is a credential for the two things links are handed
+    /// out for, and must not unlock anything else - least of all sending.
+    #[test]
+    fn a_signed_link_only_covers_what_links_are_given_out_for() {
+        assert!(is_linkable("GET", &["messages", "85", "retrieve"]));
+        assert!(is_linkable("GET", &["messages", "85", "attachments", "2"]));
+
+        assert!(!is_linkable("POST", &["messages", "85", "retrieve"]));
+        assert!(!is_linkable("GET", &["messages"]));
+        assert!(!is_linkable("GET", &["messages", "85"]));
+        assert!(!is_linkable("POST", &["sms"]));
+        assert!(!is_linkable("POST", &["mms"]));
+        assert!(!is_linkable("GET", &["health"]));
+        assert!(!is_linkable("GET", &["messages", "x", "retrieve"]));
+        assert!(!is_linkable("GET", &["messages", "85", "attachments", ""]));
     }
 
     #[test]

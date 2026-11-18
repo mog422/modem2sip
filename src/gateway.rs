@@ -1941,7 +1941,6 @@ pub async fn notify_sip_message(
 /// Human readable, deliberately small: the full MMS with its attachments
 /// stays in SQLite and is reachable over the HTTP API.
 pub fn format_mms_summary(shared: &Arc<Shared>, msg: &StoredMessage) -> String {
-    let base = shared.http_base_url();
     let mut out = String::new();
     out.push_str(&format!("[MMS] from {}\n", msg.peer));
     if let Some(subject) = &msg.subject {
@@ -1960,14 +1959,12 @@ pub fn format_mms_summary(shared: &Arc<Shared>, msg: &StoredMessage) -> String {
         out.push_str(&format!("\n-- {} attachment(s) --\n", msg.attachments.len()));
         for att in &msg.attachments {
             out.push_str(&format!(
-                "{}. {} ({}, {})\n   {}/messages/{}/attachments/{}\n",
+                "{}. {} ({}, {})\n   {}\n",
                 att.index,
                 att.name.clone().unwrap_or_else(|| format!("part{}", att.index)),
                 att.content_type,
                 human_size(att.size),
-                base,
-                msg.id,
-                att.index
+                shared.http_link(&format!("/messages/{}/attachments/{}", msg.id, att.index)),
             ));
         }
     }
@@ -1976,8 +1973,9 @@ pub fn format_mms_summary(shared: &Arc<Shared>, msg: &StoredMessage) -> String {
         // leaving a status word for the reader to interpret.
         out.push_str(&format!(
             "\n-- the message itself has not been fetched ({}) --\n\
-             fetch it:  {}/messages/{}/retrieve\n",
-            msg.status, base, msg.id
+             fetch it:  {}\n",
+            msg.status,
+            shared.http_link(&format!("/messages/{}/retrieve", msg.id)),
         ));
     }
     out

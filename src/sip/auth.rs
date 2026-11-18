@@ -12,6 +12,28 @@ pub fn md5_hex(data: &[u8]) -> String {
     out.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// HMAC-MD5 (RFC 2104), hex encoded.
+///
+/// MD5 is the hash this crate already carries for digest authentication, and
+/// as the core of an HMAC it is still sound: forging one needs the key, not
+/// a collision.
+pub fn hmac_md5_hex(key: &[u8], message: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let mut padded = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        padded[..16].copy_from_slice(&Md5::digest(key));
+    } else {
+        padded[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Md5::new();
+    inner.update(padded.map(|b| b ^ 0x36));
+    inner.update(message);
+    let mut outer = Md5::new();
+    outer.update(padded.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn random_hex(bytes: usize) -> String {
     let mut rng = rand::thread_rng();
     (0..bytes).map(|_| format!("{:02x}", rng.gen::<u8>())).collect()
@@ -335,6 +357,20 @@ mod tests {
             b"",
         );
         assert_eq!(r, "6629fae49393a05397450978507c4ef1");
+    }
+
+    /// The RFC 2202 test vectors, including a key longer than one block.
+    #[test]
+    fn hmac_md5_matches_rfc2202() {
+        assert_eq!(hmac_md5_hex(&[0x0b; 16], b"Hi There"), "9294727a3638bb1c13f48ef8158bfc9d");
+        assert_eq!(
+            hmac_md5_hex(b"Jefe", b"what do ya want for nothing?"),
+            "750c783e6ab0b503eaa86e310a5db738"
+        );
+        assert_eq!(
+            hmac_md5_hex(&[0xaa; 80], b"Test Using Larger Than Block-Size Key - Hash Key First"),
+            "6b1ab7fe4bd7bf8f0b62e6ce61b9d0cd"
+        );
     }
 
     #[test]

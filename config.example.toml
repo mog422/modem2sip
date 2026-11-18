@@ -175,3 +175,5 @@ enabled  = true
 bind     = "127.0.0.1:8088"
 # base_url = "http://192.168.1.5:8088"   # used when building attachment links
 # token    = "change-me"                 # required as: Authorization: Bearer ...
+# With a token set, the links sent to SIP peers (attachments, "fetch it")
+# carry a signature that opens that one item, so they still work in a browser.

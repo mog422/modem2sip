@@ -22,10 +22,13 @@ pub struct Shared {
     modem: RwLock<Option<Arc<ModemHandle>>>,
     /// Cheap, lock-free view of the above for the SIP fast path (503s).
     pub modem_ready: Arc<AtomicBool>,
+    /// Secret behind the signed links handed to SIP peers (see
+    /// [`Shared::http_link`]).
+    link_key: Vec<u8>,
 }
 
 impl Shared {
-    pub fn new(cfg: Arc<Config>, db: Db, mms: Arc<MmsManager>) -> Arc<Self> {
+    pub fn new(cfg: Arc<Config>, db: Db, mms: Arc<MmsManager>, link_key: Vec<u8>) -> Arc<Self> {
         Arc::new(Self {
             cfg,
             db,
@@ -33,6 +36,7 @@ impl Shared {
             sip: RwLock::new(None),
             modem: RwLock::new(None),
             modem_ready: Arc::new(AtomicBool::new(false)),
+            link_key,
         })
     }
 
@@ -105,6 +109,65 @@ impl Shared {
             .clone()
             .unwrap_or_else(|| format!("http://{}", self.cfg.http.bind))
     }
+
+    /// A link into the HTTP API for something a SIP peer is being pointed
+    /// at: an attachment to download, a message to fetch again.
+    ///
+    /// These are opened by tapping them on a phone, and a browser cannot
+    /// send `Authorization: Bearer`, so with `http.token` set they all
+    /// answered 401.  Putting the token in the link would hand the whole API
+    /// to anyone the message is shown to.  Instead the link carries a
+    /// signature over its own path: it opens that one thing and nothing
+    /// else, and says nothing about the token.
+    pub fn http_link(&self, path: &str) -> String {
+        let base = self.http_base_url();
+        if self.cfg.http.token.is_some() {
+            format!("{base}{path}?sig={}", sign_link(&self.link_key, path))
+        } else {
+            format!("{base}{path}")
+        }
+    }
+
+    /// Is `sig` the signature [`Self::http_link`] put on `path`?
+    pub fn link_signature_ok(&self, path: &str, sig: &str) -> bool {
+        let expected = sign_link(&self.link_key, path);
+        expected.len() == sig.len()
+            && expected.bytes().zip(sig.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    }
+}
+
+fn sign_link(key: &[u8], path: &str) -> String {
+    crate::sip::auth::hmac_md5_hex(key, path.as_bytes())
+}
+
+/// The key links are signed with: random, made once, kept next to the
+/// database so links already sent keep working across restarts.
+pub async fn load_link_key(dir: &std::path::Path) -> Vec<u8> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use tracing::warn;
+
+    let path = dir.join("link.key");
+    if let Ok(key) = tokio::fs::read(&path).await {
+        if key.len() >= 16 {
+            return key;
+        }
+    }
+    let key: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, &key));
+    if let Err(e) = written {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "cannot store the link key; links sent to SIP peers stop working at the next restart"
+        );
+    }
+    key
 }
 
 /// [`Shared::local_number`] for anything that holds the config but not the
@@ -142,7 +205,19 @@ pub fn to_national(number: &str, country_code: Option<&str>, national_prefix: &s
 
 #[cfg(test)]
 mod tests {
-    use super::to_national;
+    use super::{sign_link, to_national};
+
+    /// A signature opens the path it was made for and no other, and cannot
+    /// be made without the key.
+    #[test]
+    fn a_link_signature_is_bound_to_its_path_and_key() {
+        let key = [7u8; 32];
+        let sig = sign_link(&key, "/messages/85/retrieve");
+        assert_eq!(sig, sign_link(&key, "/messages/85/retrieve"));
+        assert_ne!(sig, sign_link(&key, "/messages/86/retrieve"));
+        assert_ne!(sig, sign_link(&key, "/messages/85/attachments/1"));
+        assert_ne!(sig, sign_link(&[8u8; 32], "/messages/85/retrieve"));
+    }
 
     #[test]
     fn international_becomes_national() {
