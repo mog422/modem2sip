@@ -152,7 +152,8 @@ impl ModemHandle {
         if let Err(e) = call.start().await {
             // The object exists even though the call never went out, and
             // leaving it behind is what makes the next attempt fail too.
-            self.release_call(&path, &call).await;
+            // Only dialled when the gateway is idle, so nothing else is up.
+            self.release_call(&path, &call, true).await;
             return Err(anyhow::anyhow!("Call.Start failed: {e}"));
         }
         Ok(path)
@@ -172,13 +173,31 @@ impl ModemHandle {
     /// next `Call.Start` with `IncompatibleState`.  From the outside that
     /// looks like a cancel being ignored: the cancelled call does end, but
     /// the one after it never goes out.
+    ///
+    /// For the call this gateway is running.  If the modem will not let go
+    /// of it, everything on the modem is hung up - so this must not be used
+    /// on some *other* call while ours is up; that is [`Self::hangup_only`].
     pub async fn hangup(&self, path: &OwnedObjectPath) -> Result<()> {
+        self.end_call(path, true).await
+    }
+
+    /// Hang up one call and leave every other call on the modem alone.
+    ///
+    /// For a call that is not ours while ours is in progress: a second
+    /// caller being turned away, typically.  If it will not end there is no
+    /// bigger hammer to reach for - `Voice.HangupAll` would take the call
+    /// that is actually being talked on down with it.
+    pub async fn hangup_only(&self, path: &OwnedObjectPath) -> Result<()> {
+        self.end_call(path, false).await
+    }
+
+    async fn end_call(&self, path: &OwnedObjectPath, may_hang_up_all: bool) -> Result<()> {
         let call = self.call_proxy(path).await?;
         // Hanging up an already terminated call is harmless but noisy.
         if let Err(e) = call.hangup().await {
             debug!(error = %e, "Call.Hangup failed (already gone?)");
         }
-        self.release_call(path, &call).await;
+        self.release_call(path, &call, may_hang_up_all).await;
         Ok(())
     }
 
@@ -190,11 +209,25 @@ impl ModemHandle {
     }
 
     /// Wait for the call to settle and then delete its object.
-    async fn release_call(&self, path: &OwnedObjectPath, call: &CallProxy<'_>) {
+    async fn release_call(
+        &self,
+        path: &OwnedObjectPath,
+        call: &CallProxy<'_>,
+        may_hang_up_all: bool,
+    ) {
         if !wait_terminated(call).await {
+            if !may_hang_up_all {
+                // Still up, and not ours to force.  Its object is deleted
+                // when the modem finally reports it as ended.
+                warn!(
+                    path = path.as_str(),
+                    "the modem call will not end; leaving it, another call is in progress"
+                );
+                return;
+            }
             // The modem still believes it has a call.  Hanging up everything
-            // is what clears that by hand, and one process owns one modem, so
-            // there is no other call of ours to disturb.
+            // is what clears that by hand, and the caller has said there is
+            // no other call to disturb.
             warn!(path = path.as_str(), "the modem call will not end; hanging up everything");
             if let Err(e) = self.voice.hangup_all().await {
                 warn!(error = %e, "Voice.HangupAll failed");
@@ -202,11 +235,20 @@ impl ModemHandle {
             wait_terminated(call).await;
         }
         if let Err(e) = self.voice.delete_call(path).await {
-            warn!(
-                path = path.as_str(),
-                error = %e,
-                "could not delete the modem call object; the next call may be refused"
-            );
+            // The gateway also deletes a call it does not own as soon as the
+            // modem reports it ended, and that can get here first.  Only an
+            // object that is really still listed is worth a warning.
+            let still_listed =
+                self.list_calls().await.map(|calls| calls.contains(path)).unwrap_or(true);
+            if still_listed {
+                warn!(
+                    path = path.as_str(),
+                    error = %e,
+                    "could not delete the modem call object; the next call may be refused"
+                );
+            } else {
+                debug!(path = path.as_str(), "the modem call object was already deleted");
+            }
         }
     }
 

@@ -158,7 +158,8 @@ call and the sender of a message are rendered the same way, in the `From`
 they arrive under and in the database, so a SIP client can call or reply
 straight back. Numbers dialled from the SIP side are passed on untouched.
 * Only one call at a time (one modem, one audio card): further `INVITE`s get
-  `486 Busy Here`.
+  `486 Busy Here`, and a second caller on the mobile side is turned away
+  without touching the call in progress.
 * DTMF: SIP `INFO` (`application/dtmf-relay`) and RFC 2833 both map to
   `Call.SendDtmf`; digits reported by the modem are sent to SIP as `INFO`.
 

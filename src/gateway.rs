@@ -255,12 +255,16 @@ impl Gateway {
                 state = call_state::state_name(info.state),
                 "an outgoing call from an earlier run is still up; ending it"
             );
-            let _ = modem.hangup(&path).await;
+            if self.call.is_some() {
+                turn_away(modem, path);
+            } else {
+                let _ = modem.hangup(&path).await;
+            }
             return Ok(());
         }
         if self.call.is_some() {
             info!(from = %info.number, "rejecting incoming call: already busy");
-            let _ = modem.hangup(&path).await;
+            turn_away(modem, path);
             return Ok(());
         }
 
@@ -388,6 +392,14 @@ impl Gateway {
             .filter(|c| c.mm_path.as_ref() == Some(&path))
             .map(|c| (c.role, c.ringing_sent, c.answered))
         else {
+            // Not the call we are running: one that was turned away, or one
+            // we have already let go of.  Once it has ended its object is
+            // nobody's, and ModemManager keeps it until it is deleted.
+            if new == call_state::TERMINATED {
+                if let Some(modem) = self.modem.clone() {
+                    tokio::spawn(async move { modem.delete_call(&path).await });
+                }
+            }
             return Ok(());
         };
         debug!(state = call_state::state_name(new), reason, "modem call state");
@@ -1790,6 +1802,23 @@ impl Gateway {
             notify_sip_message(shared, core, &peer, content_type, body).await;
         });
     }
+}
+
+/// End a call on the modem that is not the one the gateway is running, while
+/// that one is still up.
+///
+/// Detached, so the event loop keeps serving the call in progress - waiting
+/// for a call to settle takes seconds, during which a BYE or a digit for the
+/// live call would sit unread.  And strictly this one call: the usual hangup
+/// falls back to `Voice.HangupAll` when a call will not end, which here would
+/// cut off the caller who is actually talking in order to refuse one who is
+/// not.
+fn turn_away(modem: Arc<ModemHandle>, path: OwnedObjectPath) {
+    tokio::spawn(async move {
+        if let Err(e) = modem.hangup_only(&path).await {
+            debug!(path = path.as_str(), error = %format!("{e:#}"), "could not hang up the other call");
+        }
+    });
 }
 
 /// Deliver an incoming message to the SIP side as a MESSAGE request.
