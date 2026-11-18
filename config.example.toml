@@ -49,8 +49,9 @@ use_mm_audio_port = true            # honour Call.AudioPort when the driver sets
 
 # Quectel modems keep their USB voice path off (AT+QPCMV=0) even with
 # AT+QDAI=5, which makes every call connect but stay silent.  ModemManager has
-# no API for it, so modem2sip sends that one command itself - on start-up, on
-# every replug, and before a call if the path went away.
+# no API for it, so modem2sip sends that one command itself - whenever the
+# modem becomes ready (start-up, replug, reset), and before a call if that
+# did not succeed.
 #   "auto"   apply on Quectel modems (default)
 #   "always" apply on any modem that exposes an AT port
 #   "never"  never touch an AT port

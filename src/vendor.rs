@@ -53,12 +53,34 @@ fn is_quectel_model(model: &str) -> bool {
         .any(|p| m.starts_with(p))
 }
 
+/// Should the voice path be looked at again before a call?
+///
+/// Through ModemManager the question costs one D-Bus round trip, queued
+/// behind MM's own traffic, so it is always asked.  When MM will not relay
+/// commands the only way to ask is to open an AT port MM itself is using,
+/// flush it and talk on it - and doing that on every call means stealing
+/// replies MM was waiting for, on every call.  Enough of those and MM
+/// declares the modem unresponsive.  The setting cannot go away without the
+/// modem restarting, and a restart brings a modem-ready event that sets it
+/// again, so once it has been confirmed the port is left alone.
+pub fn worth_rechecking(modem: &crate::mm::ModemHandle) -> bool {
+    use std::sync::atomic::Ordering;
+    !modem.voice_path_ready.load(Ordering::Relaxed)
+        || MM_COMMAND.load(Ordering::Relaxed) == 1
+}
+
 /// Make sure the modem streams call audio over its USB sound card.
 ///
 /// Returns the port that accepted the command.  Best effort: a failure means
 /// calls may be silent, not that the modem is unusable, so callers log and
 /// carry on.
 pub async fn enable_usb_audio(modem: &crate::mm::ModemHandle, force: bool) -> Result<String> {
+    let port = switch_on(modem, force).await?;
+    modem.voice_path_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(port)
+}
+
+async fn switch_on(modem: &crate::mm::ModemHandle, force: bool) -> Result<String> {
     // ModemManager's own AT channel is the better route when it is open: it
     // serialises with MM's own traffic on a port MM keeps open anyway.  It is
     // only allowed when MM runs with `--debug`, so the answer is remembered

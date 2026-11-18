@@ -50,6 +50,10 @@ pub struct ModemHandle {
     pub info: ModemInfo,
     /// The ALSA card that belongs to *this* modem, if one was found.
     pub alsa: Option<AlsaCard>,
+    /// The vendor voice path (see [`crate::vendor`]) has been confirmed on
+    /// since this modem became ready.  The setting only goes away when the
+    /// modem restarts, and a restart produces a new handle.
+    pub voice_path_ready: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ModemHandle {
@@ -117,7 +121,16 @@ impl ModemHandle {
             .context("building Modem.Messaging proxy")?;
 
         let info = read_info(&conn, &path, &modem).await;
-        Ok(Arc::new(Self { conn, path, modem, voice, messaging, info, alsa }))
+        Ok(Arc::new(Self {
+            conn,
+            path,
+            modem,
+            voice,
+            messaging,
+            info,
+            alsa,
+            voice_path_ready: std::sync::atomic::AtomicBool::new(false),
+        }))
     }
 
     pub async fn signal_quality(&self) -> Option<u32> {

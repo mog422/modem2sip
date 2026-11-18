@@ -1472,10 +1472,13 @@ impl Gateway {
         };
         let (capture, playback) = resolve_audio_devices(&self.shared, &modem, call_info.as_ref())?;
 
-        // A modem that reset itself since the last call would have dropped its
-        // USB voice path again, which shows up as a perfectly connected but
-        // completely silent call.  Cheap to re-check right here.
-        if crate::vendor::applies(self.shared.cfg.audio.vendor_audio_setup, &modem.info) {
+        // A silent voice path shows up as a perfectly connected but
+        // completely silent call, so it is worth a look before each one -
+        // as long as looking does not mean talking over ModemManager on an
+        // AT port it has open (see `vendor::worth_rechecking`).
+        if crate::vendor::applies(self.shared.cfg.audio.vendor_audio_setup, &modem.info)
+            && crate::vendor::worth_rechecking(&modem)
+        {
             if let Err(e) = crate::vendor::enable_usb_audio(&modem, false).await {
                 warn!(
                     error = %format!("{e:#}"),

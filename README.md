@@ -101,7 +101,11 @@ vendor_audio_setup = "auto"   # "auto" (Quectel only) | "always" | "never"
 
 * runs on every modem-ready event, so a replug or a modem reset is covered
   (the setting is volatile);
-* re-checks before each call and only writes when the path is actually off;
+* re-checks before each call when ModemManager relays the command, and only
+  writes when the path is actually off.  When it has to open the AT port
+  itself it does not do that again once the path has been confirmed for this
+  modem: ModemManager is using the same port, and talking over it on every
+  call steals replies it was waiting for;
 * falls back to a port *ModemManager itself* classified as AT, preferring the
   last one (MM tends to keep the first for itself);
 * re-checks whether ModemManager will relay commands whenever a modem becomes
