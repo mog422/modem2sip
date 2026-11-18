@@ -449,8 +449,9 @@ to. Set at least one of the two on any interface you do not fully control.
 
 The supervisor (`mm::watcher`) reconnects to the system bus, re-scans on every
 ObjectManager change plus every 5 s, enables the modem if it comes up
-disabled, waits for it to leave `initializing`/`searching`, and re-runs the
-whole sequence whenever the device returns. Meanwhile:
+disabled, waits for it to reach `enabled` (it may still be searching for a
+network, in which case a call is refused with `503` when it is placed), and
+re-runs the whole sequence whenever the device returns. Meanwhile:
 
 * `INVITE`, `MESSAGE` → `503` + `Retry-After`
 * `OPTIONS` → `503` (`sip.options_reflect_modem`), so an upstream proxy can
