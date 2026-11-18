@@ -544,7 +544,8 @@ repeating on a modem before trusting them again.
 * SIP over UDP only; no TLS/SRTP and no video. A re-INVITE is answered and
   the media endpoint follows it, so hold/resume should survive, but neither
   that nor transfer has been tried against a real PBX.
-* G.711 only. Wide-band modem cards are resampled to 8 kHz.
+* G.711 only. Wide-band modem cards are low-pass filtered and resampled to
+  8 kHz.
 * One concurrent call per modem.
 * MMS over HTTPS MMSC URLs is not supported (plain HTTP only, which is what
   MMSCs use in practice).

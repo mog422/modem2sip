@@ -283,19 +283,27 @@ pub fn detect_dtmf_detailed(samples: &[i16], rate: u32) -> Option<DtmfHit> {
     Some(DtmfHit { digit: DTMF_KEYS[li][hi], dominance, twist })
 }
 
-/// Integer-ratio linear resampler good enough for narrow-band voice.
+/// Linear-interpolating resampler, good enough for narrow-band voice.
 /// (8k <-> 16k, occasionally 8k <-> 48k on modems with a UAC2 card.)
+///
+/// Going down in rate, the input is low-pass filtered first.  A card running
+/// at 16 kHz carries a wide-band call's audio up to 7 kHz, and dropping every
+/// other sample folds everything above 4 kHz back into the voice band, where
+/// it is heard as a metallic edge on every sibilant.
 #[derive(Debug, Clone)]
 pub struct Resampler {
     from: u32,
     to: u32,
     last: i16,
     pos: f64,
+    lowpass: Option<LowPass>,
+    filtered: Vec<i16>,
 }
 
 impl Resampler {
     pub fn new(from: u32, to: u32) -> Self {
-        Self { from, to, last: 0, pos: 0.0 }
+        let lowpass = (from > to && to > 0).then(|| LowPass::new(from, to));
+        Self { from, to, last: 0, pos: 0.0, lowpass, filtered: Vec::new() }
     }
 
     pub fn process(&mut self, input: &[i16], out: &mut Vec<i16>) {
@@ -304,6 +312,13 @@ impl Resampler {
             out.extend_from_slice(input);
             return;
         }
+        let input: &[i16] = match self.lowpass.as_mut() {
+            Some(lowpass) => {
+                lowpass.process(input, &mut self.filtered);
+                &self.filtered
+            }
+            None => input,
+        };
         let step = self.from as f64 / self.to as f64;
         let mut pos = self.pos;
         while pos < input.len() as f64 {
@@ -319,6 +334,62 @@ impl Resampler {
         if let Some(last) = input.last() {
             self.last = *last;
         }
+    }
+}
+
+/// The anti-aliasing filter in front of a downsampling [`Resampler`]: a
+/// Hamming-windowed sinc, cutting off just below half the output rate.
+///
+/// Fixed point throughout.  It runs once per input sample on the audio
+/// thread, and the routers this is built for have no FPU.
+#[derive(Debug, Clone)]
+struct LowPass {
+    /// Coefficients in Q15.
+    taps: Vec<i32>,
+    /// The tail of the previous block, so the filter runs across block
+    /// boundaries without a seam.
+    history: Vec<i16>,
+    work: Vec<i16>,
+}
+
+impl LowPass {
+    fn new(from: u32, to: u32) -> Self {
+        use std::f64::consts::PI;
+        let ratio = from as f64 / to as f64;
+        // Long enough for a transition band of about 1 kHz at 8 kHz out, and
+        // odd so the delay is a whole number of samples.
+        let n = ((24.0 * ratio).ceil() as usize) | 1;
+        // Cutoff as a fraction of the input rate: 0.46 of the output rate,
+        // i.e. 3.7 kHz for 8 kHz out, so the stop band starts by 4 kHz.
+        let fc = 0.46 / ratio;
+        let mid = (n - 1) as f64 / 2.0;
+        let ideal: Vec<f64> = (0..n)
+            .map(|i| {
+                let x = i as f64 - mid;
+                let sinc = if x == 0.0 { 2.0 * fc } else { (2.0 * PI * fc * x).sin() / (PI * x) };
+                let window = 0.54 - 0.46 * (2.0 * PI * i as f64 / (n - 1) as f64).cos();
+                sinc * window
+            })
+            .collect();
+        // Unity gain at DC, whatever the truncation did to the sum.
+        let sum: f64 = ideal.iter().sum();
+        let taps = ideal.iter().map(|v| (v / sum * 32768.0).round() as i32).collect();
+        Self { taps, history: vec![0; n - 1], work: Vec::new() }
+    }
+
+    fn process(&mut self, input: &[i16], out: &mut Vec<i16>) {
+        out.clear();
+        let n = self.taps.len();
+        self.work.clear();
+        self.work.extend_from_slice(&self.history);
+        self.work.extend_from_slice(input);
+        for window in self.work.windows(n) {
+            let acc: i64 =
+                window.iter().zip(&self.taps).map(|(s, t)| *s as i64 * *t as i64).sum();
+            out.push(((acc + (1 << 14)) >> 15).clamp(i16::MIN as i64, i16::MAX as i64) as i16);
+        }
+        let keep = self.work.len() - (n - 1);
+        self.history.copy_from_slice(&self.work[keep..]);
     }
 }
 
@@ -465,5 +536,53 @@ mod tests {
         let mut down = Resampler::new(16000, 8000);
         down.process(&[100; 320], &mut out);
         assert!((out.len() as i32 - 160).abs() <= 1);
+    }
+
+    /// A pure tone at `freq`, `amplitude` peak, `rate` samples a second.
+    fn tone(freq: f32, amplitude: f32, rate: u32, samples: usize) -> Vec<i16> {
+        (0..samples)
+            .map(|i| (amplitude * (std::f32::consts::TAU * freq * i as f32 / rate as f32).sin()) as i16)
+            .collect()
+    }
+
+    /// Run `input` through a resampler in 20 ms blocks, the way the audio
+    /// threads do, and return the steady-state peak of what comes out.
+    fn peak_after_resampling(input: &[i16], from: u32, to: u32) -> i32 {
+        let mut resampler = Resampler::new(from, to);
+        let (mut block, mut all) = (Vec::new(), Vec::new());
+        for chunk in input.chunks(from as usize / 50) {
+            resampler.process(chunk, &mut block);
+            all.extend_from_slice(&block);
+        }
+        // Skip the filter's settling time at the start.
+        all[all.len() / 4..].iter().map(|s| (*s as i32).abs()).max().unwrap_or(0)
+    }
+
+    /// Halving the rate by dropping samples turns a 6 kHz tone into a 2 kHz
+    /// one at full volume.  It has to be filtered out before the samples go.
+    #[test]
+    fn downsampling_does_not_fold_high_frequencies_into_the_voice_band() {
+        for (from, above) in [(16_000, 6_000.0), (16_000, 5_000.0), (48_000, 7_000.0), (48_000, 13_000.0)] {
+            let peak = peak_after_resampling(&tone(above, 10_000.0, from, from as usize), from, 8000);
+            assert!(peak < 300, "{above} Hz at {from} Hz came through at {peak}");
+        }
+    }
+
+    /// The voice band itself must come through untouched, across the block
+    /// boundaries as well as inside them.
+    #[test]
+    fn downsampling_keeps_the_voice_band() {
+        for from in [16_000, 48_000] {
+            for freq in [300.0, 1_000.0, 2_500.0, 3_000.0] {
+                let peak = peak_after_resampling(&tone(freq, 10_000.0, from, from as usize), from, 8000);
+                assert!(
+                    (9_000..=10_300).contains(&peak),
+                    "{freq} Hz at {from} Hz came out at {peak} instead of 10000"
+                );
+            }
+        }
+        // Going up in rate there is nothing to fold, and nothing is filtered.
+        let peak = peak_after_resampling(&tone(1_000.0, 10_000.0, 8000, 8000), 8000, 16_000);
+        assert!((9_500..=10_100).contains(&peak), "upsampled peak {peak}");
     }
 }
