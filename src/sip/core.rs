@@ -221,12 +221,22 @@ impl SipCore {
         self.cseq.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub fn domain(&self) -> String {
-        self.cfg
-            .sip
-            .domain
-            .clone()
-            .unwrap_or_else(|| self.transport.bound().ip().to_string())
+    /// The host name this gateway goes by when talking to `peer`: the digest
+    /// realm, and the host part of the URIs it writes about itself.
+    ///
+    /// `sip.domain` when set, otherwise the address it is bound to.  Bound to
+    /// the wildcard, that used to come out as a literal `0.0.0.0` - in the
+    /// From of every call and message handed to SIP, which a phone cannot
+    /// call or reply to.  The address `peer` reaches us on is used instead.
+    pub fn domain_for(&self, peer: SocketAddr) -> String {
+        if let Some(domain) = &self.cfg.sip.domain {
+            return domain.clone();
+        }
+        let bound = self.transport.bound().ip();
+        if !bound.is_unspecified() {
+            return bound.to_string();
+        }
+        self.transport.advertised_ip(peer).to_string()
     }
 
     /// Receive loop.  Never returns unless the socket dies.
@@ -575,7 +585,7 @@ impl SipCore {
                 // to be addressing, so both have to be the ones we asked for
                 // - otherwise a response computed for one request authorises
                 // any other.
-                let realm_ok = c.realm == self.domain();
+                let realm_ok = c.realm == self.domain_for(src);
                 // Compared as parsed URIs, not as strings: UAs differ on
                 // scheme case, on which parameters they carry, and some put
                 // the To-URI here rather than the Request-URI.
@@ -623,7 +633,7 @@ impl SipCore {
             "www-authenticate",
             format!(
                 "Digest realm=\"{}\", nonce=\"{}\", algorithm=MD5, qop=\"auth\"{}",
-                self.domain(),
+                self.domain_for(src),
                 self.nonce.issue(),
                 if stale { ", stale=true" } else { "" }
             ),

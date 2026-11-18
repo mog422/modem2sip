@@ -315,7 +315,7 @@ impl Gateway {
         );
 
         let caller = self.shared.local_number(&sanitize_number(&info.number));
-        let domain = self.core.domain();
+        let domain = self.core.domain_for(target_addr);
         let from_user = if caller.is_empty() { "anonymous".to_string() } else { caller.clone() };
         let local_tag = crate::sip::auth::random_hex(6);
         let from = NameAddr {
@@ -1887,7 +1887,7 @@ pub async fn notify_sip_message(
         }
     };
 
-    let domain = core.domain();
+    let domain = core.domain_for(addr);
     // The peer is a number the network reported - for MMS it is a free-form
     // address decoded from a PDU an SMS sender wrote, so it can hold anything
     // at all, CRLF included.  It goes into a header, so it is reduced to the
