@@ -4,13 +4,14 @@
 //! (a WAP push carrying an M-Notification.ind) plus HTTP to the carrier's
 //! MMSC over the data bearer.  Both halves live here.
 
+pub mod attachment;
 pub mod dns;
 pub mod http;
 pub mod manager;
 pub mod pdu;
 pub mod wsp;
 
-pub use manager::{MmsManager, SendRequest};
+pub use manager::{MmsManager, SendRequest, Source};
 
 use anyhow::{anyhow, bail, Result};
 

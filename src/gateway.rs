@@ -949,11 +949,19 @@ impl Gateway {
                 let parsed: Result<crate::mms::SendRequest> = serde_json::from_slice(&body)
                     .context("parsing the MMS JSON body");
                 let code = match parsed {
+                    // Naming a file on this host is for the local HTTP API
+                    // only.  Over SIP it let anyone who could reach the port
+                    // have the gateway read a file of their choosing and
+                    // send it to a number of their choosing.
+                    Ok(sr) if sr.attachments.iter().any(|a| a.path.is_some()) => {
+                        warn!(%src, "rejecting an MMS over SIP that names a local file as an attachment");
+                        403
+                    }
                     Ok(mut sr) => {
                         if sr.to.is_empty() && !number.is_empty() {
                             sr.to.push(number.clone());
                         }
-                        match mms.send(sr).await {
+                        match mms.send(sr, crate::mms::Source::Sip).await {
                             Ok(id) => {
                                 info!(id, "MMS submitted from SIP");
                                 202

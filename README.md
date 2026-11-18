@@ -318,13 +318,19 @@ curl -X POST http://127.0.0.1:8088/mms -H 'Content-Type: application/json' -d '{
   "to": ["+821012345678"],
   "subject": "photo",
   "text": "here you go",
-  "attachments": [{"content_type": "image/jpeg", "name": "p.jpg", "path": "/tmp/p.jpg"}]
+  "attachments": [{"content_type": "image/jpeg", "name": "p.jpg", "path": "p.jpg"}]
 }'
 ```
 
+An attachment is either inline (`"data_base64": "..."`) or a file named by
+`path`. Files are only read from the directory set as `mms.attachment_dir` -
+by name, or by an absolute path that points into it - because the gateway
+reads them with its own privileges and sends them to whatever number the
+request names. With no directory configured, `path` is refused.
+
 The same JSON body may be sent as a SIP `MESSAGE` with
-`Content-Type: application/json`, using `data_base64` instead of `path` for
-inline attachments.
+`Content-Type: application/json`. Attachments have to be inline there: a
+`MESSAGE` that names a `path` is answered `403`.
 
 **Carrier settings are required**: `mms.mmsc` (and `mms.proxy` on carriers
 that use a WAP gateway) are operator specific.

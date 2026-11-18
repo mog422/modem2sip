@@ -156,6 +156,10 @@ enabled       = false
 # local_ip    = "10.64.0.2"
 # dns         = ["211.219.86.1"]
 auto_retrieve = true
+# Directory `POST /mms` may read attachments from when a request names them
+# by "path".  Unset, "path" is refused and attachments have to be sent inline
+# ("data_base64").  Never applies to MMS submitted over SIP.
+# attachment_dir = "/var/lib/modem2sip/modem-1/outbox"
 max_size      = 2097152
 user_agent    = "modem2sip/0.1"
 # ua_profile  = "http://example.com/uaprof.xml"

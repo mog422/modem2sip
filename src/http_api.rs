@@ -349,7 +349,7 @@ async fn handle(mut stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
             if !shared.is_ready() {
                 return respond_json(&mut stream, 503, &json!({"error": "no modem"})).await;
             }
-            match shared.mms.send(body).await {
+            match shared.mms.send(body, crate::mms::Source::Api).await {
                 Ok(id) => respond_json(&mut stream, 202, &json!({"status": "sent", "id": id})).await,
                 Err(e) => respond_json(&mut stream, 500, &json!({"error": e.to_string()})).await,
             }

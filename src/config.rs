@@ -399,6 +399,13 @@ pub struct Mms {
     /// Automatically fetch the message body when a WAP-push notification
     /// arrives.  When false only the notification is stored.
     pub auto_retrieve: bool,
+    /// Directory the HTTP API may read attachments from when a submission
+    /// names them by `path`.  Unset means `path` is refused and attachments
+    /// have to be sent inline (`data_base64`): the gateway reads the file
+    /// with its own privileges and sends it to whatever number the request
+    /// names, so there is no safe default for "anywhere on this host".
+    /// Submissions arriving over SIP can never use `path`.
+    pub attachment_dir: Option<PathBuf>,
     /// Refuse to download anything larger than this (bytes).
     pub max_size: usize,
     pub user_agent: String,
@@ -419,6 +426,7 @@ impl Default for Mms {
             local_ip: None,
             dns: Vec::new(),
             auto_retrieve: true,
+            attachment_dir: None,
             max_size: 2 * 1024 * 1024,
             user_agent: concat!("modem2sip/", env!("CARGO_PKG_VERSION")).into(),
             ua_profile: None,

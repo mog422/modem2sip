@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::db::{Db, Direction, NewMessage};
 use crate::mm::SmsInfo;
 
+use super::attachment::{self, LocalFiles, SendAttachment};
 use super::http::{self, HttpOptions};
 use super::pdu::{self, MmsMessage, MmsPart, SendReq};
 use super::{is_mms_push, parse_wap_push};
@@ -35,16 +36,14 @@ pub struct SendRequest {
     pub attachments: Vec<SendAttachment>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct SendAttachment {
-    pub content_type: String,
-    #[serde(default)]
-    pub name: Option<String>,
-    /// base64 payload, or use `path` to read from disk.
-    #[serde(default)]
-    pub data_base64: Option<String>,
-    #[serde(default)]
-    pub path: Option<String>,
+/// Where a submission came from, which decides what it may ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// A SIP `MESSAGE`.  Anyone who can reach the SIP port may be behind it,
+    /// so it never gets to name files on this host.
+    Sip,
+    /// The local HTTP API.  May attach files from `mms.attachment_dir`.
+    Api,
 }
 
 impl MmsManager {
@@ -373,7 +372,7 @@ impl MmsManager {
     }
 
     /// Submit an MMS through the MMSC.  Returns the database id.
-    pub async fn send(&self, req: SendRequest) -> Result<i64> {
+    pub async fn send(&self, req: SendRequest, source: Source) -> Result<i64> {
         if !self.cfg.mms.enabled {
             bail!("MMS is disabled (set mms.enabled = true and mms.mmsc)");
         }
@@ -398,8 +397,18 @@ impl MmsManager {
             p.params.push(("name".into(), "text0.txt".into()));
             content.push(p);
         }
+        let files = match (source, self.cfg.mms.attachment_dir.as_deref()) {
+            (Source::Sip, _) => LocalFiles::Refused(
+                "attachments sent over SIP have to be inline (data_base64)",
+            ),
+            (Source::Api, Some(dir)) => LocalFiles::Under(dir),
+            (Source::Api, None) => LocalFiles::Refused(
+                "set mms.attachment_dir to attach files by path, or send the data inline \
+                 (data_base64)",
+            ),
+        };
         for (i, att) in req.attachments.iter().enumerate() {
-            let data = load_attachment(att).await?;
+            let data = attachment::load(att, files).await?;
             let mut p = MmsPart::new(&att.content_type, data);
             p.content_id = Some(format!("part{i}"));
             if let Some(name) = &att.name {
@@ -511,21 +520,6 @@ impl MmsManager {
             }
         }
     }
-}
-
-async fn load_attachment(att: &SendAttachment) -> Result<Vec<u8>> {
-    use base64::Engine as _;
-    if let Some(b64) = &att.data_base64 {
-        return base64::engine::general_purpose::STANDARD
-            .decode(b64.trim())
-            .context("decoding data_base64");
-    }
-    if let Some(path) = &att.path {
-        return tokio::fs::read(path)
-            .await
-            .with_context(|| format!("reading attachment {path}"));
-    }
-    bail!("attachment needs either data_base64 or path")
 }
 
 fn unix_to_iso(secs: u64) -> String {
