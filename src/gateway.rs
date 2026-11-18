@@ -668,7 +668,7 @@ impl Gateway {
             return self.reply(&req, src, 503).await;
         };
 
-        let number = sanitize_number(req.uri.user.as_deref().unwrap_or(""));
+        let number = number_in(&req.uri);
         if number.is_empty() {
             return self.reply(&req, src, 484).await;
         }
@@ -960,7 +960,7 @@ impl Gateway {
             return self.reply(&req, src, 503).await;
         };
         let content_type = req.headers.content_type().unwrap_or("text/plain").to_string();
-        let number = sanitize_number(to.user.as_deref().unwrap_or(""));
+        let number = number_in(&to);
 
         if content_type.contains("json") {
             // MMS submission over SIP.
@@ -2298,6 +2298,16 @@ fn addressed_to_us(target: &Uri, own_number: Option<&str>) -> Uri {
     uri
 }
 
+/// The number a SIP URI asks for.
+///
+/// Decoded before it is cleaned up, not after: a `#` has to be written `%23`
+/// in a URI, and stripping the `%` first left its `23` behind as two more
+/// digits, so `#31#010...` was dialled as `233123010...` - a different
+/// number altogether.
+fn number_in(uri: &Uri) -> String {
+    sanitize_number(&uri.user_decoded().unwrap_or_default())
+}
+
 /// Keep digits and the few characters that are meaningful for dialling.
 pub fn sanitize_number(raw: &str) -> String {
     let raw = raw.trim();
@@ -2364,6 +2374,20 @@ mod tests {
         assert_eq!(sanitize_number("+82 10-1234-5678"), "+821012345678");
         assert_eq!(sanitize_number("tel:0212345678"), "0212345678");
         assert_eq!(sanitize_number("*123#"), "*123#");
+    }
+
+    /// What reaches the modem has to be the number the caller keyed in.
+    #[test]
+    fn the_number_is_read_from_a_decoded_uri() {
+        let dialled = |uri: &str| number_in(&Uri::parse(uri).unwrap());
+        assert_eq!(dialled("sip:%2331%2301012345678@gw"), "#31#01012345678");
+        assert_eq!(dialled("sip:*123%23@gw"), "*123#");
+        assert_eq!(dialled("sip:%2B821012345678@gw"), "+821012345678");
+        assert_eq!(dialled("sip:+82-10-1234-5678@gw"), "+821012345678");
+        assert_eq!(dialled("tel:+821012345678"), "+821012345678");
+        // An escaped line break is still not a way into the number.
+        assert_eq!(dialled("sip:0100%0D%0AContact:%20evil@gw"), "0100");
+        assert_eq!(dialled("sip:gw"), "");
     }
 
     /// The MMS sender is free-form text decoded from a PDU whoever sent the

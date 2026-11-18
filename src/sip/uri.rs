@@ -88,6 +88,19 @@ impl Uri {
         Some(Uri { scheme, user, password, host, port, params, headers: hdrs })
     }
 
+    /// The user part with its `%XX` escapes resolved.
+    ///
+    /// The struct keeps the user exactly as it was on the wire, so that a
+    /// URI written back out is the one that came in.  Anything that wants
+    /// what the user part *means* has to decode it: `#` is not allowed bare
+    /// in a SIP URI, so a number like `#31#01012345678` arrives as
+    /// `%2331%2301012345678` - and read undecoded, the escapes' own digits
+    /// pass for part of the number.
+    pub fn user_decoded(&self) -> Option<String> {
+        let user = self.user.as_deref()?;
+        Some(percent_encoding::percent_decode_str(user).decode_utf8_lossy().into_owned())
+    }
+
     /// URI parameter, e.g. `transport` or `messagetype`.
     pub fn param(&self, name: &str) -> Option<&str> {
         self.params
@@ -369,6 +382,26 @@ mod tests {
         assert_eq!(host_for_wire("10.0.0.1"), "10.0.0.1");
         // Already bracketed input is not bracketed twice.
         assert_eq!(host_for_wire("[fd00::1]"), "[fd00::1]");
+    }
+
+    /// `#` and friends travel escaped in the user part; what gets dialled
+    /// has to be the number, not the escape sequence.
+    #[test]
+    fn escapes_in_the_user_part_are_decoded_on_request() {
+        let u = Uri::parse("sip:%2331%2301012345678@gw").unwrap();
+        assert_eq!(u.user_decoded().as_deref(), Some("#31#01012345678"));
+        // The stored form, and therefore the URI on the wire, is untouched.
+        assert_eq!(u.user.as_deref(), Some("%2331%2301012345678"));
+        assert_eq!(u.to_string(), "sip:%2331%2301012345678@gw");
+
+        assert_eq!(
+            Uri::parse("sip:%2B821012345678@gw").unwrap().user_decoded().as_deref(),
+            Some("+821012345678")
+        );
+        assert_eq!(Uri::parse("sip:*123%23@gw").unwrap().user_decoded().as_deref(), Some("*123#"));
+        // Nothing to decode, and nothing there at all.
+        assert_eq!(Uri::parse("sip:0101234@gw").unwrap().user_decoded().as_deref(), Some("0101234"));
+        assert_eq!(Uri::parse("sip:gw").unwrap().user_decoded(), None);
     }
 
     /// Replacing a parameter must not leave the old copy behind.

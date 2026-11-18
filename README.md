@@ -160,6 +160,8 @@ straight back. Numbers dialled from the SIP side are passed on untouched.
 * Only one call at a time (one modem, one audio card): further `INVITE`s get
   `486 Busy Here`, and a second caller on the mobile side is turned away
   without touching the call in progress.
+* A number is read from the Request-URI after its `%XX` escapes are resolved,
+  so `sip:%2331%2301012345678@gateway` dials `#31#01012345678`.
 * DTMF: SIP `INFO` (`application/dtmf-relay`) and RFC 2833 both map to
   `Call.SendDtmf`; digits reported by the modem are sent to SIP as `INFO`.
 
